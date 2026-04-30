@@ -1,6 +1,5 @@
 """
 app.py  —  Streamlit UI for the Courseware Review System
-Place this file in the project root (same level as the src/ folder).
 Run with:  streamlit run app.py
 """
 
