@@ -2,6 +2,7 @@
 app.py  —  Streamlit UI for the Courseware Review System
 Run with:  streamlit run app.py
 """
+import logging
 
 import os
 import sys
@@ -11,6 +12,21 @@ import traceback
 from pathlib import Path
 
 import streamlit as st
+
+# ── logging setup ─────────────────────────────────────────
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+LOG_FILE = LOG_DIR / "app.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 
 # ── make src/ importable ──────────────────────────────────────────────────────
 SRC_DIR = Path(__file__).resolve().parent / "src"
@@ -149,8 +165,8 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
         ("Analysing tables & code",     lambda s: analyze_tables_and_code(s),          "table_code_done"),
         ("Checking content accuracy",   lambda s: run_accuracy_check(s),               "accuracy_done"),
         ("Running deterministic checks",lambda s: run_all_checks_step11(s),            "checks_done"),
-        ("LLM rewriting",               lambda s: run_llm_rewrite(s),                  "rewrite_done"),
-        ("Generating quizzes",          lambda s: generate_quizzes_for_units(s),       "quiz_done"),
+        ("LLM rewriting", lambda s: run_llm_rewrite(s) if getattr(s, "issues", None) else s, "rewrite_done"),
+        ("Generating quizzes", lambda s: generate_quizzes_for_units(s) if getattr(s, "units", None) else s, "quiz_done"),
     ]
 
     state = None
@@ -162,17 +178,59 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
     status_text.text(f"⏳ {label}…")
     state = fn(None)  # load doesn't use state arg
     save_checkpoint(state, checkpoint_name)
+    logging.info(f"[PIPELINE] Completed stage: {label}")
     progress_bar.progress(1 / total)
 
-    # Remaining stages: skip gracefully on error
+    # ── Lightweight backup/restore helpers ──────────────────────────────────
+    # Only mutable fields are backed up — paragraphs, images, and other
+    # ingest-time data never change so they don't need to be copied.
+    # This replaces deepcopy(state) which copied 50-100MB per stage.
+    _MUTABLE_FIELDS = [
+        "issues", "duplicate_findings", "retrieval_findings",
+        "rewrite_suggestions", "units", "ocr_results",
+        "accuracy_findings", "diagram_recommendations",
+        "generated_diagrams", "generated_visuals", "visual_specs",
+        "table_findings", "code_findings",
+        "duplicate_findings_truncated", "duplicate_findings_total",
+        "image_sources_found",
+    ]
+
+    def _backup(s):
+        return {
+            f: list(getattr(s, f, None) or [])
+            for f in _MUTABLE_FIELDS
+            if hasattr(s, f)
+        }
+
+    def _restore(s, bk):
+        for f, v in bk.items():
+            setattr(s, f, v)
+        return s
+
+    # Remaining stages: safe execution with rollback
     for i, (label, fn, checkpoint_name) in enumerate(stages[1:], start=2):
         status_text.text(f"⏳ {label}…")
+
+        backup = _backup(state)  # lightweight field-level backup
+
         try:
-            state = fn(state)
+            result = fn(state)
+
+            # Support both return-style and in-place mutation
+            if result is not None:
+                state = result
+
             save_checkpoint(state, checkpoint_name)
+            logging.info(f"[PIPELINE] Completed stage: {label}")
+
         except Exception as exc:
+            logging.exception(f"[PIPELINE ERROR] Stage failed: {label}")
+
             skipped_stages.append((label, str(exc)))
-            # state is unchanged — continue with what we have
+
+            # Restore only the mutable fields — ingest data is untouched
+            _restore(state, backup)
+
         progress_bar.progress(i / total)
 
     # Build output documents
