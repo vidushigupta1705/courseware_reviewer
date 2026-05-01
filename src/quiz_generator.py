@@ -1,11 +1,16 @@
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from mistralai.client import Mistral
 
 from config import ENABLE_QUIZ_GENERATION, QUIZ_MODEL, MAX_UNITS_FOR_QUIZ
 from models import QuizItem
 
+
+# ───────────────────────────────────────────────
+# Prompt Builder
+# ───────────────────────────────────────────────
 
 def _build_quiz_prompt(unit_title: str, unit_text: str) -> str:
     return f"""
@@ -14,30 +19,34 @@ You are generating a courseware quiz.
 Generate exactly 15 questions for the following chapter/unit.
 
 Rules:
-1. Use only the provided chapter/unit content.
-2. Do not add facts not present in the text.
+1. Use only the provided content.
+2. Do not add external facts.
 3. Return strict JSON only.
-4. JSON must contain one key: quiz
-5. quiz must be a list of exactly 15 objects in this exact order:
+4. JSON must contain key: quiz
+5. quiz must contain exactly 15 questions:
    - 3 MCQ
    - 3 Fill in the Blanks
    - 3 True/False
    - 3 Two-mark
    - 3 Four-mark
-6. Each object must contain:
+6. Each object must include:
    - qtype
    - question
-   - options (empty list unless MCQ)
+   - options (empty unless MCQ)
    - answer
-7. For MCQ, provide exactly 4 options.
+7. MCQs must have exactly 4 options.
 
-Chapter/Unit title:
+Title:
 {unit_title}
 
-Chapter/Unit content:
+Content:
 {unit_text}
 """.strip()
 
+
+# ───────────────────────────────────────────────
+# LLM Call
+# ───────────────────────────────────────────────
 
 def _call_mistral_quiz(client: Mistral, prompt: str):
     response = client.chat.complete(
@@ -52,6 +61,7 @@ def _call_mistral_quiz(client: Mistral, prompt: str):
     )
 
     content = response.choices[0].message.content
+
     if isinstance(content, list):
         content = "".join(
             chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
@@ -61,11 +71,11 @@ def _call_mistral_quiz(client: Mistral, prompt: str):
     return json.loads(content)
 
 
+# ───────────────────────────────────────────────
+# Validation
+# ───────────────────────────────────────────────
+
 def _validate_quiz_items(items):
-    """
-    Strict validation:
-    must be exactly 15 in required order
-    """
     if len(items) != 15:
         return False
 
@@ -77,13 +87,72 @@ def _validate_quiz_items(items):
         + ["Four-mark"] * 3
     )
 
-    normalized = []
-    for item in items:
-        qtype = (item.get("qtype", "") or "").strip()
-        normalized.append(qtype)
-
+    normalized = [(item.get("qtype", "") or "").strip() for item in items]
     return normalized == expected_order
 
+
+# ───────────────────────────────────────────────
+# Worker Function (Parallel)
+# ───────────────────────────────────────────────
+
+def _process_unit(client, unit):
+    if unit.quiz_present:
+        return unit
+
+    if unit.end_paragraph_index <= unit.heading_paragraph_index:
+        return unit
+
+    if not unit.body_text or len(unit.body_text.strip()) < 250:
+        return unit
+
+    try:
+        prompt = _build_quiz_prompt(unit.title, unit.body_text[:12000])
+        result = _call_mistral_quiz(client, prompt)
+        raw_items = result.get("quiz", [])
+
+        # Normalize common label variations before validating
+        _LABEL_MAP = {
+            "fill_in_the_blanks": "Fill in the Blanks",
+            "fill in the blank":  "Fill in the Blanks",
+            "true_false":         "True/False",
+            "true or false":      "True/False",
+            "two_mark":           "Two-mark",
+            "two mark":           "Two-mark",
+            "four_mark":          "Four-mark",
+            "four mark":          "Four-mark",
+            "mcq":                "MCQ",
+            "multiple choice":    "MCQ",
+        }
+        for item in raw_items:
+            raw = str(item.get("qtype") or "").strip().lower()
+            if raw in _LABEL_MAP:
+                item["qtype"] = _LABEL_MAP[raw]
+
+        if not _validate_quiz_items(raw_items):
+            print(f"[QUIZ VALIDATION FAILED] '{unit.title}' — qtypes returned: {[i.get('qtype') for i in raw_items]}")
+            return unit
+
+        quiz_items = [
+            QuizItem(
+                qtype=str(item.get("qtype") or "").strip(),
+                question=str(item.get("question") or "").strip(),
+                options=item.get("options", []) or [],
+                answer=str(item.get("answer") or "").strip(),
+            )
+            for item in raw_items
+        ]
+
+        unit.generated_quiz = quiz_items
+        return unit
+
+    except Exception as e:
+        print(f"[QUIZ ERROR] '{unit.title}': {type(e).__name__}: {e}")
+        return unit
+
+
+# ───────────────────────────────────────────────
+# Main Function
+# ───────────────────────────────────────────────
 
 def generate_quizzes_for_units(state):
     if not ENABLE_QUIZ_GENERATION:
@@ -93,47 +162,24 @@ def generate_quizzes_for_units(state):
     if not api_key:
         return state
 
+    if not getattr(state, "units", []):
+        return state
+
     client = Mistral(api_key=api_key)
-    final_units = []
 
-    for unit in state.units[:MAX_UNITS_FOR_QUIZ]:
-        if unit.quiz_present:
-            final_units.append(unit)
-            continue
+    units = state.units[:MAX_UNITS_FOR_QUIZ]
+    results = []
 
-        if unit.end_paragraph_index <= unit.heading_paragraph_index:
-            final_units.append(unit)
-            continue
+    MAX_WORKERS = 4  # safe parallelism
 
-        if not unit.body_text or len(unit.body_text.strip()) < 250:
-            final_units.append(unit)
-            continue
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(_process_unit, client, unit) for unit in units]
 
-        try:
-            prompt = _build_quiz_prompt(unit.title, unit.body_text[:12000])
-            result = _call_mistral_quiz(client, prompt)
-            raw_items = result.get("quiz", [])
+        for future in as_completed(futures):
+            results.append(future.result())
 
-            if not _validate_quiz_items(raw_items):
-                final_units.append(unit)
-                continue
+    # Maintain original order
+    results.sort(key=lambda u: u.heading_paragraph_index)
 
-            quiz_items = []
-            for item in raw_items:
-                quiz_items.append(
-                    QuizItem(
-                        qtype=(item.get("qtype", "") or "").strip(),
-                        question=(item.get("question", "") or "").strip(),
-                        options=item.get("options", []) or [],
-                        answer=(item.get("answer", "") or "").strip(),
-                    )
-                )
-
-            unit.generated_quiz = quiz_items
-            final_units.append(unit)
-
-        except Exception:
-            final_units.append(unit)
-
-    state.units = final_units
+    state.units = results
     return state
