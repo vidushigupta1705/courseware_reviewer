@@ -9,3 +9,5 @@ mistralai>=1.0.0
 graphviz>=0.20.3
 python-dotenv>=1.0.1
 streamlit>=1.35.0
+sentence-transformers
+numpy
