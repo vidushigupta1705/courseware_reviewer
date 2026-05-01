@@ -62,13 +62,34 @@ def _check_dependencies():
     def add(label, status, detail):
         results.append({"label": label, "status": status, "detail": detail})
 
-    # Required: MISTRAL_API_KEY
-    if os.environ.get("MISTRAL_API_KEY", "").strip():
+    # Required: MISTRAL_API_KEY (or Ollama fallback)
+    import requests as _req
+    from config import ENABLE_OLLAMA_FALLBACK, OLLAMA_BASE_URL
+
+    mistral_key = os.environ.get("MISTRAL_API_KEY", "").strip()
+    if mistral_key:
         add("Mistral API Key", "ok", "Found in environment")
     else:
-        add("Mistral API Key", "error",
-            "Not set — LLM rewriting and accuracy checks will not run. "
-            "Add MISTRAL_API_KEY to a .env file or set it as an environment variable.")
+        add("Mistral API Key", "warn",
+            "Not set — checking Ollama fallback.")
+
+    if ENABLE_OLLAMA_FALLBACK:
+        try:
+            r = _req.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+            if r.ok:
+                models = [m["name"] for m in r.json().get("models", [])]
+                add("Ollama (fallback LLM)", "ok",
+                    f"Running. Models: {', '.join(models) or 'none pulled — run: ollama pull llama3'}")
+            else:
+                add("Ollama (fallback LLM)", "warn", "Reachable but returned an error.")
+        except Exception:
+            if not mistral_key:
+                add("Ollama (fallback LLM)", "error",
+                    "Not reachable and MISTRAL_API_KEY is missing — LLM features will not run. "
+                    "Install Ollama from https://ollama.com and run: ollama pull llama3")
+            else:
+                add("Ollama (fallback LLM)", "warn",
+                    "Not reachable — Mistral will be used instead.")
 
     # Optional: WINSTON_API_KEY
     if os.environ.get("WINSTON_API_KEY", "").strip():
