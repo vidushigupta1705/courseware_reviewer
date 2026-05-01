@@ -60,13 +60,105 @@ def is_code_like_paragraph(text: str, style_name: str = "") -> bool:
     return score >= 3
 
 
+# ── Heading heuristic helpers ─────────────────────────────────────────────────
+
+def _collect_body_font_sizes(doc: Document) -> List[float]:
+    sizes = []
+    
+    # First try run-level explicit sizes
+    for para in doc.paragraphs:
+        style_name = (para.style.name if para.style else "Normal").lower()
+        if style_name.startswith("heading"):
+            continue
+        for run in para.runs:
+            if run.text.strip() and run.font.size:
+                val = pt_to_float(run.font.size)
+                if val is not None:
+                    sizes.append(val)
+
+    # Fallback: read from the Normal style definition if runs had no explicit size
+    if not sizes:
+        try:
+            normal_style = doc.styles["Normal"]
+            if normal_style.font and normal_style.font.size:
+                val = pt_to_float(normal_style.font.size)
+                if val is not None:
+                    sizes = [val]
+        except Exception:
+            pass
+
+    # Final fallback: standard body size
+    if not sizes:
+        sizes = [10.0]
+
+    return sizes
+
+
+def _infer_heading_level_heuristic(para, body_font_sizes: List[float]) -> Optional[int]:
+    """
+    Fallback heading detection for documents that use bold + large text
+    instead of proper Word heading styles.
+
+    All three conditions must be true:
+      - Text is short (<=12 words)
+      - Every non-empty run is explicitly bold
+      - Average font size is larger than the typical body size
+
+    Returns a synthetic heading level (1-3) or None.
+    """
+    text = para.text.strip()
+    if not text or len(text.split()) > 12:
+        return None
+
+    runs_with_text = [r for r in para.runs if r.text.strip()]
+    if not runs_with_text:
+        return None
+
+    # Every run must be explicitly bold
+    def _is_bold(run) -> bool:
+        if run.bold is True:
+            return True
+        # Check if bold is inherited from the paragraph style
+        if run.bold is None and run.style and run.style.font:
+            return bool(run.style.font.bold)
+        return False
+
+    if not all(_is_bold(r) for r in runs_with_text):
+        return None
+
+    sizes = [r.font.size.pt for r in runs_with_text if r.font.size]
+    if not sizes:
+        return None
+
+    avg_size = sum(sizes) / len(sizes)
+    typical_body = (sum(body_font_sizes) / len(body_font_sizes)) if body_font_sizes else 10.0
+
+    if avg_size >= typical_body + 4:
+        return 1
+    if avg_size >= typical_body + 2:
+        return 2
+    if avg_size > typical_body:
+        return 3
+    return None
+
+
+# ── Main extraction functions ─────────────────────────────────────────────────
+
 def extract_paragraphs(doc: Document) -> List[ParagraphInfo]:
     paragraphs = []
+    body_font_sizes = _collect_body_font_sizes(doc)
 
     for idx, para in enumerate(doc.paragraphs):
         style_name = para.style.name if para.style else "Normal"
         heading_level = detect_heading_level(style_name)
         is_heading = heading_level is not None
+
+        # Fallback: catch headings styled with bold + large font but no Word heading style
+        if not is_heading:
+            heuristic_level = _infer_heading_level_heuristic(para, body_font_sizes)
+            if heuristic_level is not None:
+                heading_level = heuristic_level
+                is_heading = True
 
         font_names = []
         font_sizes = []
@@ -110,19 +202,16 @@ def extract_paragraphs(doc: Document) -> List[ParagraphInfo]:
 def extract_tables(doc: Document) -> List[TableInfo]:
     tables = []
 
-    # Walk body children to find the paragraph index just before each table.
-    # Body children are a mix of <w:p> (paragraphs) and <w:tbl> (tables).
     W_P = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
     W_TBL = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tbl"
 
     para_count = 0
-    table_para_positions = []  # paragraph index just before each table
+    table_para_positions = []
 
     for child in doc.element.body:
         if child.tag == W_P:
             para_count += 1
         elif child.tag == W_TBL:
-            # anchor to the last paragraph seen before this table (min 0)
             table_para_positions.append(max(0, para_count - 1))
 
     for t_idx, table in enumerate(doc.tables):
@@ -157,8 +246,6 @@ def extract_tables(doc: Document) -> List[TableInfo]:
 
 def _get_rel_ids_from_paragraph(paragraph):
     rel_ids = []
-    # Only look inside w:drawing elements — these are real embedded images.
-    # w:pict elements contain bullets, themes, and background shapes — not content images.
     drawings = paragraph._element.xpath('.//*[local-name()="drawing"]')
     for drawing in drawings:
         blips = drawing.xpath('.//*[local-name()="blip"]')
@@ -172,12 +259,10 @@ def _get_rel_ids_from_paragraph(paragraph):
 def build_image_paragraph_map(doc: Document):
     """
     Returns dict: rel_id -> paragraph index
-
     Scans both regular paragraphs and table cells for embedded images.
     """
     rel_to_para = {}
 
-    # Scan regular paragraphs
     for p_idx, para in enumerate(doc.paragraphs):
         rel_ids = _get_rel_ids_from_paragraph(para)
         if rel_ids:
@@ -185,8 +270,6 @@ def build_image_paragraph_map(doc: Document):
                 if rel_id not in rel_to_para:
                     rel_to_para[rel_id] = p_idx
 
-    # Scan table cells — images inside tables won't appear in doc.paragraphs
-    # Find the nearest paragraph index before each table using body element order
     W_P = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
     W_TBL = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tbl"
 
@@ -196,7 +279,6 @@ def build_image_paragraph_map(doc: Document):
             para_count += 1
         elif child.tag == W_TBL:
             anchor_idx = max(0, para_count - 1)
-            # Only find blips inside w:drawing elements — real embedded images
             drawings = child.xpath('.//*[local-name()="drawing"]')
             for drawing in drawings:
                 blips = drawing.xpath('.//*[local-name()="blip"]')
@@ -222,20 +304,15 @@ def extract_images(doc: Document, output_dir: Path) -> List[ImageInfo]:
         if "image" not in rel.target_ref:
             continue
 
-        # Only process images that are actually embedded in the document body
-        # (paragraphs or tables). Images not in image_para_map are theme images,
-        # bullet images, backgrounds etc. — not content images.
         if rel_id not in image_para_map:
             continue
 
         image_part = rel.target_part
         image_bytes = image_part.blob
 
-        # Skip tiny images — these are typically invisible 1x1 tracking pixels,
-        # auto-inserted transparent images, or Word internal assets.
-        # Real content images are always larger than 1KB.
         if len(image_bytes) < 1024:
             continue
+
         original_name = os.path.basename(rel.target_ref)
         if not original_name:
             original_name = f"{rel_id}.png"
@@ -261,8 +338,6 @@ def extract_images(doc: Document, output_dir: Path) -> List[ImageInfo]:
                 paragraph_index=image_para_map.get(rel_id),
             )
         )
-
-    return images
 
     return images
 
