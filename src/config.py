@@ -120,3 +120,11 @@ MAX_SEMANTIC_COMPARISONS = 100
 ENABLE_SEMANTIC_DUPLICATES = True
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+# ── Ollama fallback ───────────────────────────────────────────────────────────
+# Used when MISTRAL_API_KEY is not set.
+# Install Ollama from https://ollama.com and run: ollama pull llama3
+ENABLE_OLLAMA_FALLBACK  = True
+OLLAMA_BASE_URL         = "http://localhost:11434"
+OLLAMA_REWRITE_MODEL    = "llama3"
+OLLAMA_QUIZ_MODEL       = "llama3"
+OLLAMA_ACCURACY_MODEL   = "llama3"
