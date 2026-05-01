@@ -6,45 +6,77 @@ It produces exactly two Word outputs for each input file:
 - `<Actual File Name>_Review Comments.docx`
 - `<Actual File Name>_Final Fixed.docx`
 
+---
+
 ## What the pipeline does
 
 The system combines deterministic checks with targeted API-assisted steps.
 
 ### Deterministic-first checks
-- heading/font validation
-- navigation-pane / heading hierarchy checks
-- spacing cleanup checks
-- duplicate paragraph and repeated topic detection
-- image extraction
-- figure number and source-link checks
-- table-aware checks
-- code-block-aware checks
-- chapter/unit detection for quiz placement
-- advanced visual classification and rendering
+- Heading and font validation using the document's own dominant font — does not hardcode Arial
+- Navigation-pane and heading hierarchy checks
+- Spacing cleanup (in-place, preserves bold/italic/hyperlinks)
+- Duplicate paragraph detection with structural repeat suppression (repeating page headers flagged once, not per occurrence)
+- Near-duplicate detection with Jaccard pre-filter for performance on large documents
+- Semantic duplicate detection via sentence-transformers (batched, full document)
+- Image extraction, figure number and source-link checks
+- Table-aware and code-block-aware checks
+- Chapter/unit detection for quiz placement
+- Advanced visual classification and rendering
+- TOC entries excluded from font checks — never flagged as inconsistent
 
-### API-assisted steps
+### API-assisted steps (Mistral or Ollama fallback)
 - Winston AI for plagiarism/originality screening
-- Mistral for selective paragraph rewriting
-- Mistral for quiz generation
+- Mistral (or Ollama) for selective paragraph rewriting
+- Mistral (or Ollama) for quiz generation
+- Mistral (or Ollama) for content accuracy checking
+
+---
 
 ## Key behavior
+
+### Dominant font detection
+The pipeline detects the document's own dominant heading and body fonts before running any checks or fixes. It never forces Arial onto a document that uses a different font consistently — it only flags or corrects genuine outliers.
+
+### Ollama fallback
+If `MISTRAL_API_KEY` is not set, the pipeline automatically falls back to a locally running Ollama instance. Install Ollama from https://ollama.com and run:
+
+```bash
+ollama pull llama3
+```
+
+Priority order:
+1. `MISTRAL_API_KEY` present → Mistral (fast, hosted)
+2. Key missing + Ollama running → Ollama (free, local, slower)
+3. Neither → LLM stages skip silently
 
 ### Unit-level quiz generation only
 Quizzes are generated after each **unit/chapter**, not after each topic.
 
-To support that behavior:
 - `UNIT_HEADING_LEVEL_FOR_QUIZ=1` means only `Heading 1` is treated as a chapter/unit boundary
-- chapter detection also prefers headings that contain words like `chapter`, `unit`, `module`, or `lesson`
+- Chapter detection also prefers headings containing words like `chapter`, `unit`, `module`, or `lesson`
+- Quiz insertion is drift-safe: uses heading text match in the live document rather than pre-recorded paragraph indices that shift after rewrites
+
+### Final Fixed document is comment-free
+The Final Fixed output strips all existing comments (including any from previous manual reviewers) before applying fixes. Comments belong only in the Review Comments document.
+
+### Review Comments document
+Includes a summary page prepended at the top showing:
+- Total issues found
+- Severity breakdown (High / Medium / Low / Info)
+- Top issue types with counts
+- Units detected with quiz status
 
 ### Selective Winston scanning
-Winston scanning is intentionally restricted to paragraphs that are:
-- long enough
-- not headings
-- not duplicates
-- suspicious enough to justify the cost
+Winston scanning is intentionally restricted to paragraphs that are long enough, not headings, not duplicates, and suspicious enough to justify the cost.
+
+### Pipeline resilience
+Each pipeline stage uses lightweight field-level backup instead of deep-copying the entire state. If a stage fails, only the mutable fields are rolled back — ingest data is never lost. The UI shows which stages were skipped and why.
 
 ### Checkpointing
-The pipeline saves checkpoint JSON files after major stages so large books can resume after interruption.
+The pipeline saves checkpoint JSON files after major stages so large documents can resume after interruption without rerunning completed stages.
+
+---
 
 ## Project dependencies
 
@@ -56,26 +88,28 @@ pip install -r requirements.txt
 ```
 
 ### System packages
-These are required in Colab, Ubuntu, or Debian-based environments:
+Required in Colab, Ubuntu, or Debian-based environments:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y tesseract-ocr graphviz
 ```
 
+---
+
 ## Environment variables
 
 Create a `.env` file in the project root.
 
-Minimum required:
-
 ```env
-WINSTON_API_KEY=your_winston_api_key_here
 MISTRAL_API_KEY=your_mistral_api_key_here
-SERPAPI_KEY= your_serp_api_key_here
+WINSTON_API_KEY=your_winston_api_key_here
+SERPAPI_KEY=your_serp_api_key_here
 ```
 
-You can also use the provided `.env` template and update the placeholder values.
+All three are optional if Ollama is running locally — LLM features will use Ollama, plagiarism scan and image source lookup will be skipped with visible warnings in the UI.
+
+---
 
 ## Recommended folder structure
 
@@ -93,113 +127,137 @@ courseware_review_system/
 └── src/
 ```
 
+---
+
 ## Main pipeline stages
 
 ### Step 1
-- DOCX ingestion
-- formatting checks
-- heading hierarchy checks
-- spacing checks
-- image extraction
+- DOCX ingestion with dominant font detection
+- Heading heuristic fallback for documents without Word heading styles
+- Formatting checks against document's own dominant style
+- Heading hierarchy and navigation pane checks
+- Spacing checks
+- Image extraction
 
 ### Step 2
 - OCR for image text and code screenshots
-- image OCR comments
+- Image OCR comments
 
 ### Step 3
-- figure number detection
-- image source-link detection
-- nearby caption analysis
+- Figure number detection
+- Image source-link detection
+- Nearby caption analysis
 
 ### Step 4
-- duplicate paragraph detection
-- repeated heading detection
-- duplicate topic checks
+- Exact duplicate detection (structural repeats collapsed to one finding)
+- Near-duplicate detection with Jaccard pre-filter
+- Semantic duplicate detection (full document, batched encoding)
+- Repeated heading detection (structural headings excluded)
 
 ### Step 5
 - Winston AI plagiarism/originality screening
 
 ### Step 6
-- Mistral-based rewrite for flagged sections only
+- Mistral (or Ollama) rewrite for flagged sections only
 
 ### Step 7
-- quiz detection and generation after each chapter/unit
+- Quiz detection and generation after each chapter/unit
 
 ### Step 8
-- diagram recommendation and direct quiz insertion after units
+- Diagram recommendation and quiz insertion after units (drift-safe)
 
 ### Step 9
-- deterministic diagram generation and insertion
+- Deterministic diagram generation and insertion
 
 ### Step 10
-- table-aware and code-aware analysis
-- final polish
+- Table-aware and code-aware analysis
+- Final polish
 
 ### Step 11
-- advanced visual classification
-- architecture/deployment/sequence/concept visual generation
+- Advanced visual classification
+- Architecture/deployment/sequence/concept visual generation
+- Final issue consolidation with section-level grouping for format issues
 
-## Typical run commands
+---
 
+## Typical run
+
+### Streamlit UI (recommended)
+```bash
+streamlit run app.py
+```
+
+Upload any `.docx` file and click **Run Review Pipeline**. The UI shows:
+- Live pipeline progress
+- Feature status banners (Mistral/Ollama/Winston/SerpAPI)
+- Issue summary with severity breakdown
+- Filterable issue list by severity and type
+- Download buttons for both output documents
+- Units detected with quiz status
+
+### CLI (individual stages)
 ```bash
 python run_step11.py
 ```
 
-### Checkpoint-aware resume
-All later runners are designed to resume automatically from the latest saved checkpoint for the same input filename.
+All stage runners resume automatically from the latest checkpoint for the same input filename.
+
+---
 
 ## Output contract
 
-For each input DOCX, the pipeline should output:
-- `*_Review Comments.docx` → original-like file with inline Word comments and issue highlights
-- `*_Final Fixed.docx` → corrected/augmented file with normalized formatting, inserted quizzes, visuals, and safe fixes
+For each input DOCX the pipeline outputs:
+- `*_Review Comments.docx` — original-like file with inline Word comments, issue highlights, and a summary page
+- `*_Final Fixed.docx` — corrected file with normalized formatting, inserted quizzes, visuals, safe fixes, and zero comments
+
+---
 
 ## Notes on requirements.txt
 
-The `requirements.txt` includes Python packages only. Two required system packages are **not** pip-installed:
+`requirements.txt` covers Python packages only. Two required system packages are not pip-installed:
 - `tesseract-ocr`
 - `graphviz`
+
+---
 
 ## Troubleshooting
 
 ### `ModuleNotFoundError: No module named ...`
-Run:
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### Tesseract OCR not found
-Install:
+### `ModuleNotFoundError: No module named 'sentence_transformers'`
+```bash
+pip install sentence-transformers
+```
 
+### Tesseract OCR not found
 ```bash
 sudo apt-get install -y tesseract-ocr
 ```
 
 ### Graphviz rendering fails
-Install:
-
 ```bash
 sudo apt-get install -y graphviz
 ```
 
+### Ollama not reachable
+Install from https://ollama.com, then:
+```bash
+ollama pull llama3
+ollama serve
+```
+
 ### Winston API issues
-Check:
-- `WINSTON_API_KEY` is present
-- request limits / credits are available
-- selective scan settings are not too aggressive
+- Check `WINSTON_API_KEY` is present in `.env`
+- Check request limits and credits
+- Verify `ENABLE_WINSTON = True` in `config.py`
 
 ### Mistral API issues
-Check:
-- `MISTRAL_API_KEY` is present
-- model name in config exists
-- rewrite/quiz generation flags are enabled
+- Check `MISTRAL_API_KEY` is present in `.env`
+- Verify model name in config exists
+- Check rewrite/quiz/accuracy flags are enabled in `config.py`
 
-## Suggested next improvement
 
-A production-ready next step would be a final QA validator that verifies:
-- exactly two output files were created
-- filename pattern is correct
-- quizzes are present only after units/chapters
-- inline comments exist in the review file
-- figure/source placeholders were inserted where needed
+
