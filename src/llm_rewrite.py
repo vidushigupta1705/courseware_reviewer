@@ -1,6 +1,7 @@
 import json
 import os
 from typing import List, Dict, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from mistralai.client import Mistral
 
@@ -9,9 +10,16 @@ from config import (
     MISTRAL_REWRITE_MODEL,
     MAX_REWRITE_PARAGRAPHS,
     REWRITE_MIN_PARAGRAPH_CHARS,
+    ENABLE_OLLAMA_FALLBACK,
+    OLLAMA_REWRITE_MODEL,
 )
 from models import RewriteSuggestion
+from ollama_client import call_ollama_json
 
+
+# ───────────────────────────────────────────────
+# Constants
+# ───────────────────────────────────────────────
 
 REWRITE_ELIGIBLE_ISSUES = {
     "possible_open_source_similarity",
@@ -27,30 +35,36 @@ IBM_SKIP_ISSUES = {
 }
 
 
+# ───────────────────────────────────────────────
+# Target Collection
+# ───────────────────────────────────────────────
+
 def _collect_rewrite_targets(state) -> List[Dict]:
     issue_map: Dict[int, Set[str]] = {}
-    # Also collect suggested_fix for content_accuracy issues
     accuracy_fixes: Dict[int, str] = {}
 
     for issue in state.issues:
-        if issue.paragraph_index is None:
+        idx = issue.paragraph_index
+
+        if idx is None or idx < 0 or idx >= len(state.paragraphs):
             continue
-        if issue.paragraph_index < 0 or issue.paragraph_index >= len(state.paragraphs):
-            continue
-        issue_map.setdefault(issue.paragraph_index, set()).add(issue.issue_type)
+
+        issue_map.setdefault(idx, set()).add(issue.issue_type)
+
         if issue.issue_type == "content_accuracy" and issue.suggested_fix:
-            accuracy_fixes[issue.paragraph_index] = issue.suggested_fix
+            accuracy_fixes[idx] = issue.suggested_fix
 
     targets = []
+
     for para_idx, issue_types in issue_map.items():
         para = state.paragraphs[para_idx]
-        text = para.text or ""
+        text = (para.text or "").strip()
 
         if para.is_heading:
             continue
         if getattr(para, "is_code_like", False):
             continue
-        if len(text.strip()) < REWRITE_MIN_PARAGRAPH_CHARS:
+        if len(text) < REWRITE_MIN_PARAGRAPH_CHARS:
             continue
 
         if issue_types & IBM_SKIP_ISSUES:
@@ -59,7 +73,10 @@ def _collect_rewrite_targets(state) -> List[Dict]:
                 "reason": "ibm_similarity_skip",
                 "text": text,
                 "skip": True,
-                "skip_reason": "IBM-related similarity is flagged for review but not auto-rewritten in Step 6+.",
+                "skip_reason": (
+                    "IBM-related similarity is flagged for review "
+                    "but not auto-rewritten."
+                ),
                 "suggested_fix": None,
             })
             continue
@@ -75,11 +92,17 @@ def _collect_rewrite_targets(state) -> List[Dict]:
                 "suggested_fix": accuracy_fixes.get(para_idx),
             })
 
-    targets = sorted(targets, key=lambda x: x["paragraph_index"])
+    targets.sort(key=lambda x: x["paragraph_index"])
     return targets[:MAX_REWRITE_PARAGRAPHS]
+
+
+# ───────────────────────────────────────────────
+# Prompt Builder
+# ───────────────────────────────────────────────
 
 def _build_rewrite_prompt(text: str, reason: str, suggested_fix: str = None) -> str:
     fix_instruction = ""
+
     if suggested_fix and "content_accuracy" in reason:
         fix_instruction = f"\nSpecific correction required:\n{suggested_fix}\n"
 
@@ -88,19 +111,25 @@ You are rewriting courseware content.
 
 Task:
 Rewrite the paragraph below to fix all issues identified in the reason.
-Always apply ALL of the following improvements regardless of reason:
-1. Fix all grammar errors.
-2. Fix all spelling mistakes.
-3. Fix punctuation and sentence structure.
-4. Remove unnecessary spacing or redundant wording.
-5. If the reason mentions content_accuracy, correct the factual inaccuracy described.
-6. If the reason mentions open_source_similarity, rephrase to ensure originality.
-7. Preserve all technical terms, meaning, and courseware tone.
-8. Do not add new facts.
-9. Return strict JSON only with keys:
-   - rewritten_text
-   - summary_reason
+
+Always apply ALL of the following improvements:
+1. Fix grammar errors
+2. Fix spelling mistakes
+3. Improve punctuation and sentence structure
+4. Remove redundancy and extra spacing
+5. Fix factual issues if content_accuracy is present
+6. Ensure originality if open_source_similarity is present
+7. Preserve meaning and technical accuracy
+8. Do NOT introduce new information
+
+Return STRICT JSON:
+{{
+  "rewritten_text": "...",
+  "summary_reason": "..."
+}}
+
 {fix_instruction}
+
 Reason:
 {reason}
 
@@ -108,6 +137,10 @@ Paragraph:
 {text}
 """.strip()
 
+
+# ───────────────────────────────────────────────
+# LLM Call
+# ───────────────────────────────────────────────
 
 def _call_mistral_json(client: Mistral, prompt: str) -> Dict:
     response = client.chat.complete(
@@ -122,79 +155,103 @@ def _call_mistral_json(client: Mistral, prompt: str) -> Dict:
     )
 
     content = response.choices[0].message.content
+
     if isinstance(content, list):
         content = "".join(
             chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
             for chunk in content
         )
 
-    parsed = json.loads(content)
-    return parsed
+    return json.loads(content)
 
+
+# ───────────────────────────────────────────────
+# Worker Function (Parallel)
+# ───────────────────────────────────────────────
+
+def _rewrite_single(client, use_ollama, target):
+    para_idx = target["paragraph_index"]
+    original_text = target["text"]
+    reason = target["reason"]
+
+    if target["skip"]:
+        return RewriteSuggestion(
+            paragraph_index=para_idx,
+            reason=reason,
+            original_text=original_text,
+            rewritten_text=original_text,
+            applied=False,
+            skipped=True,
+            skip_reason=target["skip_reason"],
+        )
+
+    try:
+        prompt = _build_rewrite_prompt(
+            original_text,
+            reason,
+            target.get("suggested_fix")
+        )
+
+        if use_ollama:
+            result = call_ollama_json(OLLAMA_REWRITE_MODEL, "You produce strict JSON only.", prompt)
+        else:
+            result = _call_mistral_json(client, prompt)
+
+        rewritten_text = (result.get("rewritten_text") or "").strip()
+
+        if not rewritten_text:
+            rewritten_text = original_text
+
+        return RewriteSuggestion(
+            paragraph_index=para_idx,
+            reason=reason,
+            original_text=original_text,
+            rewritten_text=rewritten_text,
+            applied=(rewritten_text != original_text),
+            skipped=False,
+            skip_reason=None,
+        )
+
+    except Exception as e:
+        return RewriteSuggestion(
+            paragraph_index=para_idx,
+            reason=reason,
+            original_text=original_text,
+            rewritten_text=original_text,
+            applied=False,
+            skipped=True,
+            skip_reason=f"Rewrite failed: {str(e)}",
+        )
+
+
+# ───────────────────────────────────────────────
+# Main Function
+# ───────────────────────────────────────────────
 
 def run_llm_rewrite(state):
     if not ENABLE_LLM_REWRITE:
         return state
 
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key:
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    use_ollama  = not mistral_key and ENABLE_OLLAMA_FALLBACK
+
+    if not mistral_key and not use_ollama:
         return state
 
-    client = Mistral(api_key=api_key)
+    client = Mistral(api_key=mistral_key) if mistral_key else None
     targets = _collect_rewrite_targets(state)
 
-    suggestions = []
+    suggestions: List[RewriteSuggestion] = []
 
-    for target in targets:
-        para_idx = target["paragraph_index"]
-        original_text = target["text"]
-        reason = target["reason"]
+    MAX_WORKERS = 5
 
-        if target["skip"]:
-            suggestions.append(
-                RewriteSuggestion(
-                    paragraph_index=para_idx,
-                    reason=reason,
-                    original_text=original_text,
-                    rewritten_text=original_text,
-                    applied=False,
-                    skipped=True,
-                    skip_reason=target["skip_reason"],
-                )
-            )
-            continue
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(_rewrite_single, client, use_ollama, t) for t in targets]
 
-        try:
-            prompt = _build_rewrite_prompt(original_text, reason, target.get("suggested_fix"))
-            result = _call_mistral_json(client, prompt)
-            rewritten_text = (result.get("rewritten_text") or "").strip()
+        for future in as_completed(futures):
+            suggestions.append(future.result())
 
-            if not rewritten_text:
-                rewritten_text = original_text
-
-            suggestions.append(
-                RewriteSuggestion(
-                    paragraph_index=para_idx,
-                    reason=reason,
-                    original_text=original_text,
-                    rewritten_text=rewritten_text,
-                    applied=True if rewritten_text != original_text else False,
-                    skipped=False,
-                    skip_reason=None,
-                )
-            )
-        except Exception as e:
-            suggestions.append(
-                RewriteSuggestion(
-                    paragraph_index=para_idx,
-                    reason=reason,
-                    original_text=original_text,
-                    rewritten_text=original_text,
-                    applied=False,
-                    skipped=True,
-                    skip_reason=f"Rewrite failed: {str(e)}",
-                )
-            )
+    suggestions.sort(key=lambda x: x.paragraph_index)
 
     state.rewrite_suggestions = suggestions
     return state
