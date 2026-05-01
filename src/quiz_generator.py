@@ -2,10 +2,17 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from mistralai.client import Mistral
+from mistralai import Mistral
 
-from config import ENABLE_QUIZ_GENERATION, QUIZ_MODEL, MAX_UNITS_FOR_QUIZ
+from config import (
+    ENABLE_QUIZ_GENERATION,
+    QUIZ_MODEL,
+    MAX_UNITS_FOR_QUIZ,
+    ENABLE_OLLAMA_FALLBACK,
+    OLLAMA_QUIZ_MODEL,
+)
 from models import QuizItem
+from ollama_client import call_ollama_json
 
 
 # ───────────────────────────────────────────────
@@ -95,7 +102,7 @@ def _validate_quiz_items(items):
 # Worker Function (Parallel)
 # ───────────────────────────────────────────────
 
-def _process_unit(client, unit):
+def _process_unit(client, use_ollama, unit):
     if unit.quiz_present:
         return unit
 
@@ -107,7 +114,12 @@ def _process_unit(client, unit):
 
     try:
         prompt = _build_quiz_prompt(unit.title, unit.body_text[:12000])
-        result = _call_mistral_quiz(client, prompt)
+
+        if use_ollama:
+            result = call_ollama_json(OLLAMA_QUIZ_MODEL, "You produce strict JSON only.", prompt)
+        else:
+            result = _call_mistral_quiz(client, prompt)
+
         raw_items = result.get("quiz", [])
 
         # Normalize common label variations before validating
@@ -158,27 +170,28 @@ def generate_quizzes_for_units(state):
     if not ENABLE_QUIZ_GENERATION:
         return state
 
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key:
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    use_ollama  = not mistral_key and ENABLE_OLLAMA_FALLBACK
+
+    if not mistral_key and not use_ollama:
         return state
 
     if not getattr(state, "units", []):
         return state
 
-    client = Mistral(api_key=api_key)
+    client = Mistral(api_key=mistral_key) if mistral_key else None
 
     units = state.units[:MAX_UNITS_FOR_QUIZ]
     results = []
 
-    MAX_WORKERS = 4  # safe parallelism
+    MAX_WORKERS = 4
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(_process_unit, client, unit) for unit in units]
+        futures = [executor.submit(_process_unit, client, use_ollama, unit) for unit in units]
 
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Maintain original order
     results.sort(key=lambda u: u.heading_paragraph_index)
 
     state.units = results
