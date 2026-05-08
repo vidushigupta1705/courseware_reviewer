@@ -3,7 +3,7 @@ import os
 from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from mistralai.client import Mistral
+from mistralai import Mistral
 
 from config import (
     ENABLE_ACCURACY_CHECK,
