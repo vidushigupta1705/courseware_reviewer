@@ -3,7 +3,7 @@ import os
 from typing import List, Dict, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from mistralai.client import Mistral
+from mistralai import Mistral
 
 from config import (
     ENABLE_LLM_REWRITE,
