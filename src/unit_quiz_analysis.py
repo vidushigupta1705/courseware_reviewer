@@ -5,10 +5,24 @@ from config import QUIZ_MIN_UNIT_TEXT_CHARS
 
 
 CHAPTER_KEYWORDS = ["chapter", "unit", "module", "lesson"]
+
 TOPIC_KEYWORDS = [
     "topic", "subtopic", "overview", "introduction", "summary",
-    "example", "examples", "exercise", "practice", "review"
+    "example", "examples", "exercise", "practice", "review",
+    "agenda", "objectives", "objective", "prerequisite", "prerequisites",
+    "about this", "what you will", "what you'll", "at a glance",
+    "table of contents", "contents", "scope", "abstract"
 ]
+
+# Headings that look like structural nav elements, never real chapter units.
+# A heading matching any of these should never anchor a quiz.
+_SKIP_AS_UNIT = {
+    "agenda", "table of contents", "contents", "toc",
+    "objectives", "learning objectives", "learning outcomes",
+    "prerequisites", "pre-requisites", "scope", "abstract",
+    "about this course", "about this module", "what you will learn",
+    "what you'll learn", "at a glance", "overview",
+}
 
 QUIZ_PATTERNS = [
     r"\bquiz\b",
@@ -45,25 +59,31 @@ def _has_topic_keyword(text: str) -> bool:
     return any(word in lower for word in TOPIC_KEYWORDS)
 
 
+def _is_nav_heading(text: str) -> bool:
+    """
+    Returns True if this heading is a structural navigation element
+    (agenda, TOC, objectives, etc.) that should never anchor a quiz unit.
+    Strips leading numbering before matching so '1. Agenda' is caught too.
+    """
+    norm = _norm(text).lower()
+    norm = re.sub(r"^\d+[\.\d]*\s*", "", norm).strip()
+    return norm in _SKIP_AS_UNIT
+
+
 def _matches_numbered_chapter_pattern(text: str) -> bool:
     """
     Matches things like:
-    - Chapter 1
-    - Unit 2
-    - Module 3
-    - Lesson 4
+    - Chapter 1 / Unit 2 / Module 3 / Lesson 4
     - 1 Introduction
     - 2. Networking Basics
     - 3: Security
     """
     text = _norm(text)
-
     patterns = [
         r"^(chapter|unit|module|lesson)\s+\d+\b",
         r"^(chapter|unit|module|lesson)\s+[ivx]+\b",
         r"^\d+\s+[A-Za-z].+",
-        r"^\d+[.:]\s*[A-Za-z].+",
-        r"^\d+\.\d+\s+[A-Za-z].+",   # keep as possible, but score lower later
+        r"^\d+[.:]\s+[A-Za-z].+",
     ]
     return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
 
@@ -80,7 +100,6 @@ def _is_likely_topic_heading(text: str) -> bool:
     if _has_topic_keyword(lower):
         return True
 
-    # subsection numbering like 1.1, 2.4, 3.2.1
     if re.match(r"^\d+\.\d+(\.\d+)*\b", text):
         return True
 
@@ -105,15 +124,13 @@ def _heading_candidates(state):
             "has_chapter_keyword": _has_chapter_keyword(text),
             "matches_numbered_pattern": _matches_numbered_chapter_pattern(text),
             "is_likely_topic": _is_likely_topic_heading(text),
+            "is_nav_heading": _is_nav_heading(text),       # new field
         })
 
     return candidates
 
 
 def _estimate_body_lengths_between_candidates(candidates, total_paragraphs):
-    """
-    Compute paragraph span length until next candidate.
-    """
     spans = []
     for i, item in enumerate(candidates):
         start_idx = item["index"]
@@ -128,18 +145,18 @@ def _estimate_body_lengths_between_candidates(candidates, total_paragraphs):
 def _choose_chapter_heading_level(state, candidates):
     """
     Strict, deterministic chapter-level selection.
-
-    Priority:
-    1. Heading level with strongest chapter keyword evidence
-    2. Heading level with strongest numbered chapter evidence
-    3. Heading level with repeated headings and substantial average body length
-    4. Smallest heading level number among viable candidates
+    Nav headings are excluded before scoring so they can't skew the result.
     """
     if not candidates:
         return None
 
+    # Nav headings are never chapter anchors — exclude from level scoring.
+    scoreable = [c for c in candidates if not c["is_nav_heading"]]
+    if not scoreable:
+        return None
+
     by_level = defaultdict(list)
-    for item in candidates:
+    for item in scoreable:
         by_level[item["heading_level"]].append(item)
 
     scored_levels = []
@@ -170,10 +187,8 @@ def _choose_chapter_heading_level(state, candidates):
             "topic_like_count": topic_like_count,
         })
 
-    # sort by best score, then prefer smaller heading level
     scored_levels.sort(key=lambda x: (-x["score"], x["level"]))
 
-    # conservative viability checks
     for item in scored_levels:
         if item["count"] >= 2 and item["avg_span"] >= 3:
             return item["level"]
@@ -183,13 +198,14 @@ def _choose_chapter_heading_level(state, candidates):
 
 def _filter_real_chapter_headings(candidates, chapter_level):
     """
-    Keep only headings at chosen chapter level, then prefer:
-    - chapter keywords
-    - chapter numbering
-    - not topic-like
-    If no keyword headings exist, fallback to all non-topic headings at that level.
+    Keep only headings at the chosen chapter level.
+    Nav headings are always excluded regardless of level match.
+    Falls back progressively: strong → non-topic → all at that level.
     """
-    level_items = [x for x in candidates if x["heading_level"] == chapter_level]
+    level_items = [
+        x for x in candidates
+        if x["heading_level"] == chapter_level and not x["is_nav_heading"]   # nav always excluded
+    ]
     if not level_items:
         return []
 
@@ -197,7 +213,6 @@ def _filter_real_chapter_headings(candidates, chapter_level):
         x for x in level_items
         if (x["has_chapter_keyword"] or x["matches_numbered_pattern"]) and not x["is_likely_topic"]
     ]
-
     if strong:
         return strong
 
@@ -210,43 +225,79 @@ def _filter_real_chapter_headings(candidates, chapter_level):
 
 def _chapter_has_quiz(paragraphs, start_idx, end_idx):
     """
-    Check only inside this chapter, and only in heading paragraphs.
-    Avoids false positives from regular body text that mentions
-    words like 'questions' or 'exercise'.
+    Check only heading paragraphs inside this chapter to avoid false positives
+    from body text that mentions 'questions' or 'exercise'.
     """
     for idx in range(start_idx + 1, end_idx + 1):
         para = paragraphs[idx]
         if not para.is_heading:
             continue
-        text = para.text
-        if text and _looks_like_quiz_text(text):
+        if para.text and _looks_like_quiz_text(para.text):
             return True
     return False
+
+
+def _build_whole_document_unit(state) -> list:
+    """
+    Fallback: treat the entire document as a single lesson unit.
+    Used when no reliable chapter-level headings are found.
+    The quiz will be appended at the very end of the document.
+    """
+    paragraphs = state.paragraphs
+    if not paragraphs:
+        return []
+
+    body_parts = [p.text for p in paragraphs if p.text and p.text.strip()]
+    body_text = "\n".join(body_parts).strip()
+
+    if len(body_text) < QUIZ_MIN_UNIT_TEXT_CHARS:
+        return []
+
+    # Use the first heading as the unit title if one exists, else a generic label.
+    title = next(
+        (p.text.strip() for p in paragraphs if p.is_heading and p.text and p.text.strip()),
+        "Lesson",
+    )
+
+    quiz_present = any(
+        _looks_like_quiz_text(p.text)
+        for p in paragraphs
+        if p.is_heading and p.text
+    )
+
+    return [{
+        "title": title,
+        "heading_paragraph_index": paragraphs[0].index,
+        "heading_level": 1,
+        "start_paragraph_index": paragraphs[0].index,
+        "end_paragraph_index": paragraphs[-1].index,   # always the true end
+        "body_text": body_text,
+        "quiz_present": quiz_present,
+    }]
 
 
 def detect_units(state):
     """
     Detect full chapter/unit boundaries only.
-    Generate quiz once per chapter, never per topic.
+    One quiz per chapter, placed at the end of that chapter's content.
 
-    This function is intentionally conservative and robust across:
-    - Chapter 1 / Unit 1 / Module 1 style headings
-    - numbered chapter headings like '1 Introduction'
-    - documents with inconsistent heading levels
+    Falls back to treating the whole document as one unit when no reliable
+    chapter headings are found — this ensures the quiz always goes at the end,
+    never near an agenda or TOC heading near the top.
     """
     candidates = _heading_candidates(state)
     if not candidates:
-        return []
+        return _build_whole_document_unit(state)
 
     chapter_level = _choose_chapter_heading_level(state, candidates)
     if chapter_level is None:
-        return []
+        return _build_whole_document_unit(state)
 
     chapter_headings = _filter_real_chapter_headings(candidates, chapter_level)
     chapter_headings = sorted(chapter_headings, key=lambda x: x["index"])
 
     if not chapter_headings:
-        return []
+        return _build_whole_document_unit(state)
 
     units = []
 
@@ -256,7 +307,7 @@ def detect_units(state):
         if i < len(chapter_headings) - 1:
             end_idx = chapter_headings[i + 1]["index"] - 1
         else:
-            end_idx = len(state.paragraphs) - 1
+            end_idx = len(state.paragraphs) - 1    # last chapter runs to true document end
 
         if end_idx <= start_idx:
             continue
@@ -283,4 +334,6 @@ def detect_units(state):
             "quiz_present": quiz_present,
         })
 
-    return units
+    # If all detected chapters were filtered out (e.g. all too short),
+    # fall back to whole-document unit so we don't silently produce nothing.
+    return units if units else _build_whole_document_unit(state)
