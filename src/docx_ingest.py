@@ -40,22 +40,31 @@ def is_code_like_paragraph(text: str, style_name: str = "") -> bool:
         return True
 
     score = 0
-    if re.search(r"[{}();=<>\[\]#]", text):
-        score += 1
-    if re.search(r"\bdef\s+\w+\s*\(", text):
-        score += 2
-    if re.search(r"\bclass\s+\w+", text):
-        score += 2
-    if re.search(r"\bimport\s+\w+", text):
-        score += 2
-    if re.search(r"\bfor\b.*:", text):
-        score += 1
-    if re.search(r"\bif\b.*:", text):
-        score += 1
-    if re.search(r"^\s{2,}\S+", text, flags=re.MULTILINE):
-        score += 1
-    if re.search(r"<[^>]+>", text):
-        score += 1
+    if re.search(r"[{}();=<>\[\]#]", text):                score += 1
+    if re.search(r"\bdef\s+\w+\s*\(", text):               score += 2
+    if re.search(r"\bclass\s+\w+", text):                   score += 2
+    if re.search(r"\bimport\s+\w+", text):                  score += 2
+    if re.search(r"\bfor\b.*:", text):                      score += 1
+    if re.search(r"\bif\b.*:", text):                       score += 1
+    if re.search(r"^\s{2,}\S+", text, flags=re.MULTILINE): score += 1
+    if re.search(r"<[^>]+>", text):                        score += 1
+
+    # Shell variables like $?, $HOME, $PATH
+    if re.search(r"\$[\w?#@!]", text):                     score += 3
+
+    # Cron expressions (5 time fields)
+    if re.search(r"(\d+|\*|\*/\d+)\s+(\d+|\*|\*/\d+)\s+(\d+|\*)\s+(\d+|\*)\s+(\d+|\*)", text): score += 3
+
+    # Shell commands at start of text or after a colon/label
+    if re.search(r"(^|:\s*)\s*(sudo|apt[\w-]*|yum|pip[\w-]*|npm|chmod|chown|grep|curl|wget|ssh|scp|mkdir|rm|ls|cd|cp|mv|cat|echo|export|source)\b", text, re.IGNORECASE | re.MULTILINE): score += 3
+
+    # Shell command verb mid-sentence combined with flags (e.g. "use grep -r")
+    if re.search(r"\b(grep|sed|awk|find|curl|wget|chmod|sudo|apt|pip|npm|ssh)\b", text, re.I) and re.search(r"\s-[\w-]+", text): score += 3
+
+    # Multiple CLI flags strongly indicate technical content
+    flags = re.findall(r"\s--?[a-zA-Z][\w-]*", text)
+    if len(flags) >= 2:   score += 3
+    elif len(flags) == 1: score += 1
 
     return score >= 3
 
