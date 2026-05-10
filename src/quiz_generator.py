@@ -56,26 +56,35 @@ Content:
 # ───────────────────────────────────────────────
 
 def _call_mistral_quiz(client: Mistral, prompt: str):
-    response = client.chat.complete(
-        model=QUIZ_MODEL,
-        messages=[
-            {"role": "system", "content": "You produce strict JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-        random_seed=11,
-    )
-
-    content = response.choices[0].message.content
-
-    if isinstance(content, list):
-        content = "".join(
-            chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
-            for chunk in content
-        )
-
-    return json.loads(content)
+    import time
+    MAX_RETRIES = 4
+    delay = 2
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.chat.complete(
+                model=QUIZ_MODEL,
+                messages=[
+                    {"role": "system", "content": "You produce strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                random_seed=11,
+            )
+            content = response.choices[0].message.content
+            if isinstance(content, list):
+                content = "".join(
+                    chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
+                    for chunk in content
+                )
+            return json.loads(content)
+        except Exception as e:
+            if "429" in str(e) and attempt < MAX_RETRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
+    return {}
 
 
 # ───────────────────────────────────────────────
@@ -86,18 +95,21 @@ def _validate_quiz_items(items):
     if len(items) != 15:
         return False
 
-    expected_order = (
-        ["MCQ"] * 3
-        + ["Fill in the Blanks"] * 3
-        + ["True/False"] * 3
-        + ["Two-mark"] * 3
-        + ["Four-mark"] * 3
-    )
+    EXPECTED_COUNTS = {
+        "MCQ": 3,
+        "Fill in the Blanks": 3,
+        "True/False": 3,
+        "Two-mark": 3,
+        "Four-mark": 3,
+    }
 
-    normalized = [(item.get("qtype", "") or "").strip() for item in items]
-    return normalized == expected_order
+    actual_counts = {}
+    for item in items:
+        qtype = (item.get("qtype", "") or "").strip()
+        actual_counts[qtype] = actual_counts.get(qtype, 0) + 1
 
-
+    return all(actual_counts.get(k, 0) >= v for k, v in EXPECTED_COUNTS.items())
+   
 # ───────────────────────────────────────────────
 # Worker Function (Parallel)
 # ───────────────────────────────────────────────
