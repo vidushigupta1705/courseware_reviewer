@@ -15,6 +15,17 @@ from models import (
     ReviewIssue,
 )
 
+# Single source of truth — must stay in sync between save and load.
+_DYNAMIC_ATTRS = (
+    "duplicate_findings",
+    "retrieval_findings",
+    "table_findings",
+    "code_findings",
+    "accuracy_findings",        # was missing from save_checkpoint
+    "diagram_recommendations",
+    "generated_diagrams",
+)
+
 
 def _to_plain(obj):
     if is_dataclass(obj):
@@ -35,11 +46,9 @@ def save_checkpoint(state: DocumentState, stage_name: str):
 
     payload = state.to_dict()
 
-    # include optional dynamic attrs if present
-    if hasattr(state, "duplicate_findings"):
-        payload["duplicate_findings"] = getattr(state, "duplicate_findings")
-    if hasattr(state, "retrieval_findings"):
-        payload["retrieval_findings"] = getattr(state, "retrieval_findings")
+    for attr in _DYNAMIC_ATTRS:
+        if hasattr(state, attr):
+            payload[attr] = _to_plain(getattr(state, attr))
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -98,11 +107,11 @@ def load_checkpoint(base_filename: str, stage_name: str):
         rewrite_suggestions=_load_rewrite_suggestions(data.get("rewrite_suggestions", [])),
         units=_load_units(data.get("units", [])),
         issues=_load_issues(data.get("issues", [])),
+        visual_specs=data.get("visual_specs", []),      
+        generated_visuals=data.get("generated_visuals", []),  
     )
 
-    if "duplicate_findings" in data:
-        state.duplicate_findings = data["duplicate_findings"]
-    if "retrieval_findings" in data:
-        state.retrieval_findings = data["retrieval_findings"]
+    for attr in _DYNAMIC_ATTRS:
+        setattr(state, attr, data.get(attr, []))   # safe default — no KeyError
 
     return state
