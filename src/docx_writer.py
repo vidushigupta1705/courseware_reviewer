@@ -9,7 +9,7 @@ from docx.enum.text import WD_BREAK
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, Emu
 from docx.text.paragraph import Paragraph
 
 from config import (
@@ -24,6 +24,9 @@ from config import (
     ADVANCED_VISUAL_WIDTH_INCHES,
 )
 from utils import clean_spacing, normalize_text
+
+# Absolute ceiling for any inserted image — safe for A4 and Letter with standard margins
+MAX_IMAGE_WIDTH_INCHES = 6.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,6 +81,36 @@ def _get_dominant_font(doc: Document, is_heading: bool):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Image sizing helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_page_body_width_inches(doc: Document) -> float:
+    """
+    Return the usable body width in inches from the first section's page settings.
+    Falls back to 6.0 inches if section info is unavailable.
+    """
+    try:
+        section = doc.sections[0]
+        page_width   = section.page_width    # Emu
+        left_margin  = section.left_margin   # Emu
+        right_margin = section.right_margin  # Emu
+        body_width_emu = page_width - left_margin - right_margin
+        return body_width_emu / 914400       # Emu → inches
+    except Exception:
+        return 6.0
+
+
+def _safe_image_width(doc: Document, requested_inches: float) -> Inches:
+    """
+    Return an Inches value that fits within the page body width.
+    Never exceeds the usable page area regardless of what the caller requests.
+    """
+    body_width = _get_page_body_width_inches(doc)
+    capped = min(requested_inches, body_width, MAX_IMAGE_WIDTH_INCHES)
+    return Inches(capped)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Comment stripping
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -108,7 +141,6 @@ def _strip_all_comments(doc: Document):
         if hasattr(part, '_comments_part') and part._comments_part is not None:
             comments_elem = part._comments_part._element
             if comments_elem is not None:
-                # Remove all w:comment children
                 for child in list(comments_elem):
                     comments_elem.remove(child)
     except Exception:
@@ -232,15 +264,18 @@ def clean_doc_spacing(doc: Document):
                     run.font.size = Pt(target_size)
 
         elif len(meaningful_runs) > 1:
-            meaningful_runs[0].text = cleaned
-            for run in meaningful_runs[1:]:
-                run.text = ""
-            run = meaningful_runs[0]
-            if target_font and run.font.name and run.font.name != target_font:
-                run.font.name = target_font
-            if target_size and run.font.size:
-                if abs(run.font.size.pt - target_size) > 0.5:
-                    run.font.size = Pt(target_size)
+            # Only strip edges and fix double spaces within each run
+            # Never collapse — preserves bold/italic/hyperlink formatting
+            meaningful_runs[0].text = re.sub(r'  +', ' ', meaningful_runs[0].text.lstrip())
+            meaningful_runs[-1].text = re.sub(r'  +', ' ', meaningful_runs[-1].text.rstrip())
+            for run in meaningful_runs[1:-1]:
+                run.text = re.sub(r'  +', ' ', run.text)
+            first = meaningful_runs[0]
+            if target_font and first.font.name and first.font.name != target_font:
+                first.font.name = target_font
+            if target_size and first.font.size:
+                if abs(first.font.size.pt - target_size) > 0.5:
+                    first.font.size = Pt(target_size)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -548,12 +583,18 @@ def add_missing_summary_headings(doc: Document):
     """
     Detect paragraphs that begin with summary/conclusion phrases and
     insert a Heading 3 before them if one is not already present.
+    Only triggers when the paragraph clearly represents a standalone summary
+    section — not mid-paragraph phrases in technical content.
     """
     SUMMARY_PATTERNS = [
-        r'^in summary[,\s]', r'^to summarize[,\s]',
-        r'^in conclusion[,\s]', r'^to conclude[,\s]',
-        r'^summary[:\s]', r'^conclusion[:\s]',
-        r'^overall[,\s]', r'^in brief[,\s]',
+        r'^in summary\s*[,:]',
+        r'^to summarize\s*[,:]',
+        r'^in conclusion\s*[,:]',
+        r'^to conclude\s*[,:]',
+        r'^summary\s*:',
+        r'^conclusion\s*:',
+        r'^overall\s*[,:]',
+        r'^in brief\s*[,:]',
     ]
 
     dom_heading_font, dom_heading_size = _get_dominant_font(doc, is_heading=True)
@@ -567,6 +608,12 @@ def add_missing_summary_headings(doc: Document):
         if style.startswith("heading") or style.startswith("toc"):
             continue
         if any(re.match(p, text) for p in SUMMARY_PATTERNS):
+            # Long paragraphs are flowing prose, not standalone summary sections
+            if len(para.text.split()) > 30:
+                continue
+            # Skip paragraphs with technical content (cron, variables, symbols)
+            if re.search(r'\d+\s+[\d*]|\$[\w?]|[{}();]', para.text):
+                continue
             if i > 0:
                 prev_style = (doc.paragraphs[i - 1].style.name if doc.paragraphs[i - 1].style else "").lower()
                 if prev_style.startswith("heading"):
@@ -721,6 +768,7 @@ def _find_unit_end_in_doc(doc: Document, unit_title: str) -> Optional[int]:
 
     return len(doc.paragraphs) - 1
 
+
 def insert_generated_quizzes_after_units(doc: Document, state):
     """
     Insert generated quiz at the end of each unit that is missing one.
@@ -803,6 +851,10 @@ def insert_generated_quizzes_after_units(doc: Document, state):
 
 
 def insert_generated_diagrams(doc: Document, state):
+    """
+    Insert auto-generated diagrams into the document.
+    Images are capped to the page body width and centred.
+    """
     diagrams = sorted(
         getattr(state, "generated_diagrams", []),
         key=lambda x: x["paragraph_index"],
@@ -825,10 +877,18 @@ def insert_generated_diagrams(doc: Document, state):
             caption_para.runs[0].font.name = REQUIRED_BODY_FONT
             caption_para.runs[0].font.size = Pt(REQUIRED_BODY_SIZE_PT)
         image_para = insert_paragraph_after(caption_para)
-        image_para.add_run().add_picture(img_path, width=Inches(DIAGRAM_IMAGE_WIDTH_INCHES))
+        image_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        image_para.add_run().add_picture(
+            img_path,
+            width=_safe_image_width(doc, DIAGRAM_IMAGE_WIDTH_INCHES)
+        )
 
 
 def insert_advanced_visuals(doc: Document, state):
+    """
+    Insert advanced generated visuals into the document.
+    Images are capped to the page body width and centred.
+    """
     visuals = sorted(
         [v for v in getattr(state, "generated_visuals", []) if v.status == "success" and v.image_path],
         key=lambda x: x.paragraph_index,
@@ -848,20 +908,38 @@ def insert_advanced_visuals(doc: Document, state):
             label_para.runs[0].font.name = REQUIRED_BODY_FONT
             label_para.runs[0].font.size = Pt(REQUIRED_BODY_SIZE_PT)
         image_para = insert_paragraph_after(label_para)
-        image_para.add_run().add_picture(item.image_path, width=Inches(ADVANCED_VISUAL_WIDTH_INCHES))
+        image_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        image_para.add_run().add_picture(
+            item.image_path,
+            width=_safe_image_width(doc, ADVANCED_VISUAL_WIDTH_INCHES)
+        )
 
 
 def polish_doc_structure(doc: Document):
-    """Remove consecutive blank paragraphs. Never removes image paragraphs."""
-    blank_paras = []
+    """Remove consecutive blank paragraphs and empty heading-styled paragraphs."""
+    to_remove = []
     prev_blank = False
+
     for para in doc.paragraphs:
         has_drawing = bool(para._element.xpath('.//*[local-name()="drawing"]'))
-        is_blank = not (para.text and para.text.strip()) and not has_drawing
+        style_lower = (para.style.name if para.style else "").lower()
+        is_heading_style = style_lower.startswith("heading")
+        is_blank_text = not (para.text and para.text.strip())
+
+        # Remove heading-styled paragraphs with no visible text
+        # (these show up as empty entries in the Navigation Pane)
+        if is_heading_style and is_blank_text and not has_drawing:
+            to_remove.append(para)
+            prev_blank = False
+            continue
+
+        # Remove consecutive blank non-heading paragraphs
+        is_blank = is_blank_text and not has_drawing
         if is_blank and prev_blank:
-            blank_paras.append(para)
+            to_remove.append(para)
         prev_blank = is_blank
-    for para in blank_paras:
+
+    for para in to_remove:
         _remove_paragraph(para)
 
 
@@ -897,7 +975,7 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     6. Add missing summary headings
     7. Add missing image captions and source links
     8. Insert generated quizzes at unit ends (drift-safe)
-    9. Insert advanced visuals / diagrams
+    9. Insert advanced visuals / diagrams (page-width capped, centred)
     10. Polish structure (remove excess blanks)
     11. Justify body paragraphs
     12. Normalize styles using document's own dominant font
@@ -960,7 +1038,7 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     # ── Step 8: Quizzes (drift-safe) ──────────────────────────────────────
     insert_generated_quizzes_after_units(doc, state)
 
-    # ── Step 9: Visuals / diagrams ────────────────────────────────────────
+    # ── Step 9: Visuals / diagrams (page-width capped, centred) ──────────
     if getattr(state, "generated_visuals", None):
         insert_advanced_visuals(doc, state)
     elif getattr(state, "generated_diagrams", None):
