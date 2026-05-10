@@ -2,7 +2,7 @@ import re
 import logging
 from collections import defaultdict
 from rapidfuzz.fuzz import ratio
-from sentence_transformers import SentenceTransformer
+
 import numpy as np
 
 from utils import normalize_text
@@ -10,16 +10,17 @@ from config import (
     MIN_PARAGRAPH_LEN_FOR_DUP_CHECK,
     NEAR_DUPLICATE_THRESHOLD,
     JACCARD_SIMILARITY_THRESHOLD,
+    MAX_FUZZY_CANDIDATES,
     SEMANTIC_SIMILARITY_THRESHOLD,
     MAX_NEAR_DUP_PER_PARAGRAPH,
+    MAX_DUPLICATE_FINDINGS,
+    MAX_SEMANTIC_COMPARISONS,
     ENABLE_SEMANTIC_DUPLICATES,
     EMBEDDING_MODEL_NAME,
 )
 
 logger = logging.getLogger(__name__)
 
-# If a paragraph repeats more than this many times, it is a structural/template
-# element (page header, course title, boilerplate). Flag it ONCE with a count.
 STRUCTURAL_REPEAT_THRESHOLD = 5
 
 STRUCTURAL_HEADINGS = {
@@ -37,9 +38,11 @@ STRUCTURAL_HEADINGS = {
 
 _embedding_model = None
 
+
 def _get_model():
     global _embedding_model
     if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
         logger.info(
             f"[Semantic Duplicates] Loading sentence-transformer model "
             f"'{EMBEDDING_MODEL_NAME}'. First run may download ~90MB."
@@ -90,8 +93,11 @@ def analyze_duplicates(state):
         if len(idxs) <= 1:
             continue
 
+        if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+            logger.warning("[Duplicates] MAX_DUPLICATE_FINDINGS reached during exact duplicate scan.")
+            break
+
         if len(idxs) > STRUCTURAL_REPEAT_THRESHOLD:
-            # Repeating template element — flag exactly ONCE with count
             structural_norms.add(norm)
             duplicate_findings.append({
                 "type": "exact_duplicate_paragraph",
@@ -102,9 +108,10 @@ def analyze_duplicates(state):
                 "text_preview": paragraphs[idxs[0]].text[:200],
             })
         else:
-            # Genuine content duplication — flag each occurrence
             keep = idxs[0]
             for dup in idxs[1:]:
+                if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+                    break
                 duplicate_findings.append({
                     "type": "exact_duplicate_paragraph",
                     "keep_index": keep,
@@ -121,6 +128,9 @@ def analyze_duplicates(state):
             heading_map[norm_cache.get(p.index, "")].append(p.index)
 
     for key, idxs in heading_map.items():
+        if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+            logger.warning("[Duplicates] MAX_DUPLICATE_FINDINGS reached during heading scan.")
+            break
         if len(idxs) <= 1:
             continue
         original_text = paragraphs[idxs[0]].text
@@ -130,6 +140,8 @@ def analyze_duplicates(state):
             continue
         keep = idxs[0]
         for dup in idxs[1:]:
+            if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+                break
             duplicate_findings.append({
                 "type": "repeated_heading",
                 "keep_index": keep,
@@ -143,7 +155,6 @@ def analyze_duplicates(state):
         if "duplicate_index" in f
     )
 
-    # Candidates: non-heading, long enough, not a structural repeating element
     candidate_indexes = [
         p.index for p in paragraphs
         if p.text
@@ -152,10 +163,22 @@ def analyze_duplicates(state):
         and norm_cache.get(p.index, "") not in structural_norms
     ]
 
-    # ── 3. Fuzzy near-duplicate (full document, no cap) ───────────────────────
+    if len(candidate_indexes) > 300:
+        logger.warning(
+            f"[Duplicates] {len(candidate_indexes)} candidates — "
+            f"fuzzy check may be slow on this document."
+        )
+
+    # ── 3. Fuzzy near-duplicate ───────────────────────────────────────────────
+    if len(candidate_indexes) > MAX_FUZZY_CANDIDATES:
+        candidate_indexes = candidate_indexes[:MAX_FUZZY_CANDIDATES]
     per_para_count = defaultdict(int)
+    fuzzy_cap_hit = False
 
     for i in range(len(candidate_indexes)):
+        if fuzzy_cap_hit:
+            break
+
         idx_i = candidate_indexes[i]
 
         if per_para_count[idx_i] >= MAX_NEAR_DUP_PER_PARAGRAPH:
@@ -164,6 +187,11 @@ def analyze_duplicates(state):
         text_i = norm_cache[idx_i]
 
         for j in range(i + 1, len(candidate_indexes)):
+            if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+                logger.warning("[Duplicates] MAX_DUPLICATE_FINDINGS reached during fuzzy scan.")
+                fuzzy_cap_hit = True
+                break
+
             idx_j = candidate_indexes[j]
 
             if (idx_i, idx_j) in already_marked:
@@ -192,11 +220,21 @@ def analyze_duplicates(state):
                 per_para_count[idx_i] += 1
                 already_marked.add((idx_i, idx_j))
 
-    # ── 4. Semantic duplicates (full document, batched) ───────────────────────
+    # ── 4. Semantic duplicates ────────────────────────────────────────────────
     if ENABLE_SEMANTIC_DUPLICATES and candidate_indexes:
+        # Cap inputs BEFORE encoding — model.encode takes all texts at once
+        # so limiting candidates here saves both memory and encode time.
+        semantic_candidates = candidate_indexes[:MAX_SEMANTIC_COMPARISONS]
+
+        if len(candidate_indexes) > MAX_SEMANTIC_COMPARISONS:
+            logger.warning(
+                f"[Semantic Duplicates] {len(candidate_indexes)} candidates — "
+                f"capped to {MAX_SEMANTIC_COMPARISONS} for semantic comparison."
+            )
+
         try:
             model = _get_model()
-            all_texts = [paragraphs[i].text for i in candidate_indexes]
+            all_texts = [paragraphs[i].text for i in semantic_candidates]
             logger.info(f"[Semantic Duplicates] Encoding {len(all_texts)} paragraphs…")
 
             embeddings = model.encode(
@@ -207,13 +245,24 @@ def analyze_duplicates(state):
             )
             logger.info("[Semantic Duplicates] Encoding complete.")
 
-            n = len(candidate_indexes)
+            n = len(semantic_candidates)
             for i in range(n):
-                idx_i = candidate_indexes[i]
+                if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+                    logger.warning("[Duplicates] MAX_DUPLICATE_FINDINGS reached during semantic scan.")
+                    break
+
+                idx_i = semantic_candidates[i]
+
                 for j in range(i + 1, n):
-                    idx_j = candidate_indexes[j]
+                    if len(duplicate_findings) >= MAX_DUPLICATE_FINDINGS:
+                        break
+
+                    idx_j = semantic_candidates[j]
 
                     if (idx_i, idx_j) in already_marked:
+                        continue
+
+                    if _jaccard_fast(norm_cache[idx_i], norm_cache[idx_j]) < 0.3:
                         continue
 
                     score = float(np.dot(embeddings[i], embeddings[j]))
