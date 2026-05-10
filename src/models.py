@@ -168,6 +168,12 @@ class DocumentState:
     generated_visuals: List[GeneratedVisual] = field(default_factory=list)
     accuracy_findings: List[AccuracyFinding] = field(default_factory=list)
     issues: List[ReviewIssue] = field(default_factory=list)
+    duplicate_findings: List[dict] = field(default_factory=list)
+    retrieval_findings: List[dict] = field(default_factory=list)
+    diagram_recommendations: List[dict] = field(default_factory=list)
+    generated_diagrams: List[dict] = field(default_factory=list)
+    table_findings: List[dict] = field(default_factory=list)
+    code_findings: List[dict] = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
