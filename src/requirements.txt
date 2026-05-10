@@ -5,7 +5,7 @@ pytesseract>=0.3.10
 rapidfuzz>=3.9.0
 opencv-python-headless>=4.10.0.84
 requests>=2.32.0
-mistralai>=1.0.0
+mistralai==1.5.1
 graphviz>=0.20.3
 python-dotenv>=1.0.1
 streamlit>=1.35.0
