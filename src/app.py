@@ -166,7 +166,7 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
     from visual_spec_builder import build_visual_specs
     from advanced_visual_renderer import render_advanced_visuals
     from table_code_analysis import analyze_tables_and_code
-    from deterministic_checks import run_all_checks_step11
+    from deterministic_checks import run_all_checks_full
     from llm_rewrite import run_llm_rewrite
     from accuracy_checker import run_accuracy_check
     from quiz_generator import generate_quizzes_for_units
@@ -185,7 +185,7 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
         ("Rendering advanced visuals",  lambda s: render_advanced_visuals(s),          "advanced_visual_done"),
         ("Analysing tables & code",     lambda s: analyze_tables_and_code(s),          "table_code_done"),
         ("Checking content accuracy",   lambda s: run_accuracy_check(s),               "accuracy_done"),
-        ("Running deterministic checks",lambda s: run_all_checks_step11(s),            "checks_done"),
+        ("Running deterministic checks", lambda s: run_all_checks_full(s), "checks_done"),
         ("LLM rewriting", lambda s: run_llm_rewrite(s) if getattr(s, "issues", None) else s, "rewrite_done"),
         ("Generating quizzes", lambda s: generate_quizzes_for_units(s) if getattr(s, "units", None) else s, "quiz_done"),
     ]
@@ -220,7 +220,6 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
         return {
             f: list(getattr(s, f, None) or [])
             for f in _MUTABLE_FIELDS
-            if hasattr(s, f)
         }
 
     def _restore(s, bk):
@@ -229,10 +228,12 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
         return s
 
     # Remaining stages: safe execution with rollback
+    # Remaining stages: safe execution with rollback
     for i, (label, fn, checkpoint_name) in enumerate(stages[1:], start=2):
         status_text.text(f"⏳ {label}…")
 
         backup = _backup(state)  # lightweight field-level backup
+        stage_succeeded = False
 
         try:
             result = fn(state)
@@ -241,19 +242,23 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
             if result is not None:
                 state = result
 
-            save_checkpoint(state, checkpoint_name)
-            logging.info(f"[PIPELINE] Completed stage: {label}")
+            stage_succeeded = True
 
         except Exception as exc:
             logging.exception(f"[PIPELINE ERROR] Stage failed: {label}")
-
             skipped_stages.append((label, str(exc)))
-
             # Restore only the mutable fields — ingest data is untouched
             _restore(state, backup)
 
-        progress_bar.progress(i / total)
+        # Only checkpoint AFTER confirmed success — never on failure
+        if stage_succeeded:
+            save_checkpoint(state, checkpoint_name)
+            logging.info(f"[PIPELINE] Completed stage: {label}")
+        else:
+            logging.warning(f"[PIPELINE] Stage skipped/failed, checkpoint NOT saved: {label}")
 
+        progress_bar.progress(i / total)
+        
     # Build output documents
     status_text.text("⏳ Building output documents…")
     base = uploaded_docx_path.stem
