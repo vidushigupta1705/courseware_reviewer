@@ -53,29 +53,37 @@ Unit content:
 # ───────────────────────────────────────────────
 
 def _call_mistral_accuracy(client: Mistral, prompt: str) -> List[Dict]:
-    response = client.chat.complete(
-        model=ACCURACY_MODEL,
-        messages=[
-            {"role": "system", "content": "You produce strict JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-        random_seed=42,
-    )
-
-    content = response.choices[0].message.content
-
-    if isinstance(content, list):
-        content = "".join(
-            chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
-            for chunk in content
-        )
-
-    parsed = json.loads(content)
-    findings = parsed.get("findings", [])
-
-    return findings if isinstance(findings, list) else []
+    import time
+    MAX_RETRIES = 4
+    delay = 2
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.chat.complete(
+                model=ACCURACY_MODEL,
+                messages=[
+                    {"role": "system", "content": "You produce strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                random_seed=42,
+            )
+            content = response.choices[0].message.content
+            if isinstance(content, list):
+                content = "".join(
+                    chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
+                    for chunk in content
+                )
+            parsed = json.loads(content)
+            findings = parsed.get("findings", [])
+            return findings if isinstance(findings, list) else []
+        except Exception as e:
+            if "429" in str(e) and attempt < MAX_RETRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+            else:
+                return []
+    return []
 
 
 # ───────────────────────────────────────────────
