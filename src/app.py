@@ -211,13 +211,11 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
     # ingest-time data never change so they don't need to be copied.
     # This replaces deepcopy(state) which copied 50-100MB per stage.
     _MUTABLE_FIELDS = [
-        "issues", "duplicate_findings", "retrieval_findings",
-        "rewrite_suggestions", "units", "ocr_results",
-        "accuracy_findings", "diagram_recommendations",
-        "generated_diagrams", "generated_visuals", "visual_specs",
-        "table_findings", "code_findings",
-        "duplicate_findings_truncated", "duplicate_findings_total",
-        "image_sources_found",
+    "issues", "duplicate_findings", "retrieval_findings",
+    "rewrite_suggestions", "units", "ocr_results",
+    "accuracy_findings", "diagram_recommendations",
+    "generated_diagrams", "generated_visuals", "visual_specs",
+    "table_findings", "code_findings",
     ]
 
     def _backup(s):
