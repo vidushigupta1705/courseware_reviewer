@@ -178,7 +178,11 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
         ("Running OCR",                 lambda s: run_ocr_for_document(s),             "ocr_done"),
         ("Analysing image metadata",    lambda s: analyze_image_neighbors(s),          "image_metadata_done"),
         ("Checking duplicates",         lambda s: analyze_duplicates(s),               "duplicates_done"),
-        ("Winston similarity scan",     lambda s: analyze_winston_similarity(s),       "winston_done"),
+        ("Winston similarity scan",
+        lambda s: analyze_winston_similarity(s)
+        if st.session_state.get("winston_enabled", True)
+        else s,
+        "winston_done"),
         ("Building units",              lambda s: build_units(s),                      "units_done"),
         ("Recommending diagrams",       lambda s: analyze_diagram_recommendations(s),  "diagram_recommend_done"),
         ("Building visual specs",       lambda s: build_visual_specs(s),               "visual_spec_done"),
@@ -345,8 +349,25 @@ with st.sidebar:
         st.success("All required checks passed.")
 
     st.markdown("---")
-    st.caption("Upload a .docx file on the right to begin.")
+    st.subheader("⚙️ Feature Controls")
 
+    winston_enabled = st.toggle(
+        "🔍 Winston AI Plagiarism Scan",
+        value=st.session_state.get("winston_enabled", True),
+        help="Disable to preserve Winston AI credits. Plagiarism scanning will be skipped entirely.",
+    )
+    st.session_state.winston_enabled = winston_enabled
+
+    if not winston_enabled:
+        st.caption("⚠️ Winston scan is OFF — plagiarism check will be skipped.")
+    else:
+        if os.environ.get("WINSTON_API_KEY", "").strip():
+            st.caption("✅ Winston scan is ON and API key is ready.")
+        else:
+            st.caption("⚠️ Winston scan is ON but WINSTON_API_KEY is not set.")
+
+    st.markdown("---")
+    st.caption("Upload a .docx file on the right to begin.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UI — Main area
