@@ -12,7 +12,7 @@ from docx_ingest import load_docx_state
 from ocr_pipeline import run_ocr_for_document
 from image_metadata_analysis import analyze_image_neighbors
 from duplicate_analysis import analyze_duplicates
-from retrieval_similarity import analyze_retrieval_similarity
+from winston_similarity import analyze_winston_similarity
 from deterministic_checks import run_all_checks_step5
 from docx_writer import build_review_comments_doc, build_final_fixed_doc
 from utils import save_json
@@ -23,7 +23,7 @@ def process_file(input_file: Path):
     state = run_ocr_for_document(state)
     state = analyze_image_neighbors(state)
     state = analyze_duplicates(state)
-    state = analyze_retrieval_similarity(state)
+    state = analyze_winston_similarity(state)
     state = run_all_checks_step5(state)
 
     review_comments_path = REVIEW_COMMENTS_DIR / f"{state.base_filename}_Review Comments.docx"
