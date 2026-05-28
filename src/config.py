@@ -151,7 +151,7 @@ DIAGRAM_PROCESS_KEYWORDS = [
 
 ENABLE_DIAGRAM_GENERATION  = True
 MAX_GENERATED_DIAGRAMS     = 10
-DIAGRAM_IMAGE_WIDTH_INCHES = 5.8
+DIAGRAM_IMAGE_WIDTH_INCHES = 5.5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Table & code analysis  (Step 10)
@@ -174,7 +174,7 @@ CODE_BLOCK_STYLE_NAMES = ["code", "source code", "preformatted"]
 
 ENABLE_ADVANCED_VISUALS            = True
 MAX_ADVANCED_VISUALS               = 12
-ADVANCED_VISUAL_WIDTH_INCHES       = 6.2
+ADVANCED_VISUAL_WIDTH_INCHES       = 5.5
 VISUAL_ENTITY_LIMIT                = 8
 VISUAL_RELATION_LIMIT              = 10
 ENABLE_LLM_VISUAL_SPEC_ENHANCEMENT = False  # keep deterministic by default
