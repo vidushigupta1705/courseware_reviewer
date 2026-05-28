@@ -83,8 +83,8 @@ def _build_flow_diagram(text: str, out_base: Path):
         nodes = ["Start", "Process", "End"]
 
     dot = Digraph(format="png")
-    dot.attr(rankdir="LR", dpi="150")
-    dot.attr("graph", fontname="Arial", fontsize="14")
+    dot.attr(rankdir="LR", dpi="96")         # just change 150 → 96
+    dot.attr("graph", fontname="Arial", fontsize="14", size="5.5,7.5")   # add size here
     dot.attr("node", shape="box", style="rounded", fontname="Arial", fontsize="14", margin="0.3,0.2")
     dot.attr("edge", fontname="Arial", fontsize="12")
 
@@ -104,8 +104,8 @@ def _build_lifecycle_diagram(text: str, out_base: Path):
         nodes = ["Input", "Process", "Output"]
 
     dot = Digraph(format="png")
-    dot.attr(rankdir="LR", dpi="150")
-    dot.attr("graph", fontname="Arial", fontsize="14")
+    dot.attr(rankdir="LR", dpi="96")         # just change 150 → 96
+    dot.attr("graph", fontname="Arial", fontsize="14", size="5.5,7.5")   # add size here
     dot.attr("node", shape="ellipse", fontname="Arial", fontsize="14", margin="0.3,0.2")
     dot.attr("edge", fontname="Arial", fontsize="12")
 
@@ -126,8 +126,8 @@ def _build_comparison_diagram(text: str, out_base: Path):
         nodes = ["Option A", "Comparison Point", "Option B"]
 
     dot = Digraph(format="png")
-    dot.attr(rankdir="TB", dpi="150")
-    dot.attr("graph", fontname="Arial", fontsize="14")
+    dot.attr(rankdir="TB", dpi="96")         # just change 150 → 96
+    dot.attr("graph", fontname="Arial", fontsize="14", size="5.5,7.5")   # add size here
     dot.attr("node", shape="box", fontname="Arial", fontsize="14", margin="0.3,0.2")
     dot.attr("edge", fontname="Arial", fontsize="12")
 
