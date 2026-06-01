@@ -17,9 +17,9 @@ def _render_graphviz_visual(spec, out_base: Path):
     dot = Digraph(format="png")
 
     if spec.visual_type in {"architecture_diagram", "deployment_diagram"}:
-    dot.attr(rankdir="TB")
-    dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
-    dot.attr("node", shape="box", style="rounded,filled")
+        dot.attr(rankdir="TB")
+        dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
+        dot.attr("node", shape="box", style="rounded,filled")
     elif spec.visual_type == "sequence_diagram":
         dot.attr(rankdir="LR")
         dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
