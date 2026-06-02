@@ -223,17 +223,60 @@ def _filter_real_chapter_headings(candidates, chapter_level):
     return level_items
 
 
+def _is_quiz_pseudo_heading(para) -> bool:
+    """
+    Return True for short paragraphs that act as quiz section titles
+    even when they carry no Word heading style (e.g. 'Quiz', 'MCQ', 'Review Questions'
+    authored as bold Normal-style paragraphs).
+    """
+    text = (para.text or "").strip()
+    if not text or len(text.split()) > 12:
+        return False
+    return _looks_like_quiz_text(text)
+
+
 def _chapter_has_quiz(paragraphs, start_idx, end_idx):
     """
-    Check only heading paragraphs inside this chapter to avoid false positives
-    from body text that mentions 'questions' or 'exercise'.
+    Detect whether this chapter already contains a quiz section.
+
+    Checks:
+    1. Word-styled heading paragraphs with quiz keywords.
+    2. Short pseudo-heading paragraphs with quiz keywords (bold Normal-style).
+    3. MCQ body structure: numbered question followed by 2+ lettered options.
     """
+    mcq_option_count = 0
+    MCQ_OPTION_PATTERN = re.compile(r'^\s*[A-Da-d][)\.]\s*\S')
+    MCQ_QUESTION_PATTERN = re.compile(r'^\s*\d+[\.\)]\s*\S')
+    # Inline options pattern: "A) ... B) ... C)" all on one line
+    INLINE_OPTIONS_PATTERN = re.compile(
+        r'[A-D][)\.].+[A-D][)\.].+[A-D][\.\)]', re.IGNORECASE
+    )
+    in_numbered_question = False
+
     for idx in range(start_idx + 1, end_idx + 1):
         para = paragraphs[idx]
-        if not para.is_heading:
-            continue
-        if para.text and _looks_like_quiz_text(para.text):
+        text = para.text or ""
+
+        # Signal 1 & 2: heading or short pseudo-heading with quiz keyword
+        if _is_quiz_pseudo_heading(para):
             return True
+        # Signal 4: inline MCQ — question with options all on the same line
+        if INLINE_OPTIONS_PATTERN.search(text):
+            return True
+
+        # Signal 3: MCQ structure — numbered question + 2 lettered options
+        if MCQ_QUESTION_PATTERN.match(text):
+            in_numbered_question = True
+            mcq_option_count = 0
+        elif MCQ_OPTION_PATTERN.match(text) and in_numbered_question:
+            mcq_option_count += 1
+            if mcq_option_count >= 2:
+                return True
+        else:
+            if text.strip():
+                in_numbered_question = False
+                mcq_option_count = 0
+
     return False
 
 
@@ -259,10 +302,10 @@ def _build_whole_document_unit(state) -> list:
         "Lesson",
     )
 
-    quiz_present = any(
-        _looks_like_quiz_text(p.text)
-        for p in paragraphs
-        if p.is_heading and p.text
+    quiz_present = _chapter_has_quiz(
+        paragraphs,
+        start_idx=0,
+        end_idx=len(paragraphs) - 1,
     )
 
     return [{
