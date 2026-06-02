@@ -22,7 +22,7 @@ from deterministic_checks import run_all_checks_step11
 from llm_rewrite import run_llm_rewrite
 from accuracy_checker import run_accuracy_check
 from quiz_generator import generate_quizzes_for_units
-from docx_writer import build_review_comments_doc, build_final_fixed_doc
+from docx_writer import build_review_comments_doc, build_final_fixed_doc, _inject_image_issues
 from utils import save_json
 from checkpoint_manager import save_checkpoint, load_checkpoint
 
@@ -117,6 +117,7 @@ def process_file(input_file: Path, resume=True):
     final_fixed_path      = FINAL_FIXED_DIR     / f"{state.base_filename}_Final Fixed.docx"
     json_path             = INTERMEDIATE_JSON_DIR / f"{state.base_filename}_step11_state.json"
 
+    _inject_image_issues(state, input_file)   
     build_review_comments_doc(input_file, state, review_comments_path)
     build_final_fixed_doc(input_file, state, final_fixed_path)
     save_json(state.to_dict(), json_path)
