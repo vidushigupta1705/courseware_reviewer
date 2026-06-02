@@ -170,7 +170,7 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
     from llm_rewrite import run_llm_rewrite
     from accuracy_checker import run_accuracy_check
     from quiz_generator import generate_quizzes_for_units
-    from docx_writer import build_review_comments_doc, build_final_fixed_doc
+    from docx_writer import build_review_comments_doc, build_final_fixed_doc, _inject_image_issues
     from checkpoint_manager import save_checkpoint
 
     stages = [
@@ -270,6 +270,7 @@ def _run_pipeline(uploaded_docx_path: Path, progress_bar, status_text):
     REVIEW_COMMENTS_DIR.mkdir(parents=True, exist_ok=True)
     FINAL_FIXED_DIR.mkdir(parents=True, exist_ok=True)
 
+    _inject_image_issues(state, uploaded_docx_path)  
     build_review_comments_doc(uploaded_docx_path, state, review_path)
     build_final_fixed_doc(uploaded_docx_path, state, fixed_path)
 
