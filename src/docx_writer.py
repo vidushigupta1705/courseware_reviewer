@@ -239,8 +239,10 @@ def clean_doc_spacing(doc: Document):
         style_name = para.style.name if para.style else "Normal"
         style_lower = style_name.lower()
 
-        # Never touch TOC entries or image paragraphs
-        if style_lower.startswith("toc"):
+        # Never touch TOC entries, heading paragraphs, or image paragraphs.
+        # Headings are formatted separately — applying clean_spacing() to them
+        # can collapse intentional multi-word spacing and break alignment.
+        if style_lower.startswith("toc") or style_lower.startswith("heading"):
             continue
         has_drawing = bool(para._element.xpath('.//*[local-name()="drawing"]'))
         if has_drawing:
@@ -252,9 +254,9 @@ def clean_doc_spacing(doc: Document):
         if cleaned == para.text.strip():
             continue
 
-        is_heading = style_lower.startswith("heading")
-        target_font = dom_heading_font if is_heading else dom_body_font
-        target_size = dom_heading_size if is_heading else dom_body_size
+        is_heading = False  # headings are skipped above
+        target_font = dom_body_font
+        target_size = dom_body_size
 
         meaningful_runs = [r for r in para.runs if r.text.strip()]
 
@@ -379,6 +381,7 @@ _ISSUE_TYPE_TAG = {
     "near_duplicate_paragraph":         "[Duplicate]",
     "semantic_duplicate_paragraph":     "[Duplicate]",
     "possible_duplicate_topic":         "[Duplicate]",
+    "image_caption_and_source_missing": "[Image]",
     "image_caption_missing":            "[Image]",
     "image_source_missing":             "[Image]",
     "figure_number_missing":            "[Image]",
@@ -527,7 +530,12 @@ def _inject_image_issues(state, original_file: Path = None) -> None:
     reflects every auto-insertion that build_final_fixed_doc will make.
     """  
     from image_source_finder import find_sources_for_images
-    image_sources = find_sources_for_images(state)
+    # Cache on state so build_final_fixed_doc reuses the exact same resolved URLs —
+    # calling find_sources_for_images twice can produce different results (API timing,
+    # network variance) which causes Review doc and Fixed doc to diverge.
+    if not getattr(state, '_cached_image_sources', None):
+        state._cached_image_sources = find_sources_for_images(state)
+    image_sources = state._cached_image_sources
 
     seen_caption = set()
     seen_source  = set()
@@ -538,6 +546,11 @@ def _inject_image_issues(state, original_file: Path = None) -> None:
     else:
         figure_counter = 1
 
+    existing_issues = {
+    (i.issue_type, i.paragraph_index)
+    for i in getattr(state, "issues", [])
+    }
+    
     for img in state.images:
         if img.paragraph_index is None:
             continue
@@ -572,14 +585,26 @@ def _inject_image_issues(state, original_file: Path = None) -> None:
             fix_parts.append("Replace the source placeholder with a verified URL or reference.")
             seen_source.add((target_idx, source_url))
 
-        state.issues.append(ReviewIssue(
-            issue_type      = "image_caption_missing" if needs_caption else "image_source_missing",
-            severity        = "medium",
-            paragraph_index = target_idx,
-            location        = f"Image: {img.filename or 'unknown'} (paragraph {target_idx})",
-            message         = " | ".join(msg_parts),
-            suggested_fix   = " ".join(fix_parts),
-        ))
+        if needs_caption and needs_source:
+            issue_type = "image_caption_and_source_missing"
+        elif needs_caption:
+            issue_type = "image_caption_missing"
+        else:
+            issue_type = "image_source_missing"
+
+        issue_key = (issue_type, target_idx)
+
+        if issue_key not in existing_issues:
+            state.issues.append(
+                ReviewIssue(
+                    issue_type=issue_type,
+                    severity="medium",
+                    paragraph_index=target_idx,
+                    location=f"Image: {img.filename or 'unknown'} (paragraph {target_idx})",
+                    message=" | ".join(msg_parts),
+                    suggested_fix=" ".join(fix_parts),
+                )
+            )
 
 def build_review_comments_doc(original_file: Path, state, output_path: Path):
     """
@@ -587,9 +612,61 @@ def build_review_comments_doc(original_file: Path, state, output_path: Path):
     Copies the original, adds inline Word comments for every issue,
     and prepends a summary page.
     Does NOT strip existing comments — reviewer may want to see them.
+
+    Also inserts the same visible figure-caption and source-link placeholder
+    lines that build_final_fixed_doc inserts, so both output documents stay
+    in alignment (same placeholders, same positions, same figure numbers).
     """
     doc = copy_docx(original_file)
     add_inline_comments_to_doc(doc, state)
+
+    # ── Insert visible caption / source placeholders ──────────────────────
+    # Mirrors build_final_fixed_doc Step 7 exactly so the Review doc shows
+    # the same "Figure N: ..." and "Source: ..." lines that the Fixed doc has.
+    # Uses the image_sources dict already cached by _inject_image_issues so
+    # both documents always reference the same resolved URLs.
+    from image_source_finder import find_sources_for_images
+    if not getattr(state, '_cached_image_sources', None):
+        state._cached_image_sources = find_sources_for_images(state)
+    image_sources = state._cached_image_sources
+
+    figure_counter = _get_next_figure_number(doc)
+    caption_inserted_at = set()
+    source_inserted_at = set()
+
+    for img in state.images:
+        if img.paragraph_index is None:
+            continue
+        target_idx = (
+            img.nearest_caption_paragraph_index
+            if img.nearest_caption_paragraph_index is not None
+            else img.paragraph_index
+        )
+        _img_source_url = image_sources.get(img.filename) or "Source: [Add source URL/reference here]"
+        needs_caption = (not img.nearest_caption_text) and (target_idx not in caption_inserted_at)
+        needs_source  = (not img.has_source_link) and ((target_idx, _img_source_url) not in source_inserted_at)
+
+        if needs_caption or needs_source:
+            figure_text = (
+                    f"[REVIEW NOTE] Missing Figure Caption\n"
+                    f"Figure {figure_counter}: Image description/caption to be finalized."
+                    if needs_caption else None
+                )
+            source_text = (
+                    f"[REVIEW NOTE] Missing Image Source\n"
+                    f"{_img_source_url}"
+                    if needs_source else None
+                )
+
+            _append_caption_then_source(doc, target_idx, figure_text, source_text)
+
+            if needs_caption:
+                caption_inserted_at.add(target_idx)
+                figure_counter += 1
+            if needs_source:
+                source_inserted_at.add((target_idx, _img_source_url))
+    # ── End caption / source insertion ───────────────────────────────────
+
     add_ocr_summary_to_review_doc(doc, state)
     _insert_review_summary(doc, state)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -617,12 +694,37 @@ def _get_next_figure_number(doc: Document) -> int:
     return max_fig + 1
 
 
+def _is_list_item(para) -> bool:
+    """Return True if the paragraph is part of a numbered or bulleted list."""
+    return bool(para._element.xpath('.//*[local-name()="numPr"]'))
+
+
 def _append_caption_then_source(doc: Document, idx: int, figure_text: str, source_text: str):
-    """Insert figure caption then source link after an image paragraph."""
+    """Insert figure caption then source link after an image paragraph.
+    
+    If the image sits inside a numbered list (e.g. between step 3 and step 4),
+    we walk forward past all consecutive list items before inserting so the
+    list is never split in the middle.
+    """
     if idx is None or idx < 0 or idx >= len(doc.paragraphs):
         anchor = doc.paragraphs[-1] if doc.paragraphs else doc.add_paragraph()
     else:
         anchor = doc.paragraphs[idx]
+
+    # Walk forward past any immediately following list-item paragraphs so we
+    # don't insert captions in the middle of a numbered/bulleted list.
+    current_idx = idx if idx is not None else 0
+    while current_idx + 1 < len(doc.paragraphs):
+        next_para = doc.paragraphs[current_idx + 1]
+        # Stop walking if the next paragraph is not a list item, is an image,
+        # or already has a figure caption (don't skip past the end of the list's section).
+        if not _is_list_item(next_para):
+            break
+        has_drawing = bool(next_para._element.xpath('.//*[local-name()="drawing"]'))
+        if has_drawing:
+            break
+        current_idx += 1
+        anchor = next_para
 
     def _has_caption_nearby(para_idx):
         for check_idx in range(para_idx, min(para_idx + 4, len(doc.paragraphs))):
@@ -632,7 +734,7 @@ def _append_caption_then_source(doc: Document, idx: int, figure_text: str, sourc
 
     caption_anchor = anchor
 
-    if figure_text and not _has_caption_nearby(idx if idx is not None else 0):
+    if figure_text and not _has_caption_nearby(current_idx):
         new_cap = insert_paragraph_after(caption_anchor)
         run = new_cap.add_run(figure_text)
         run.italic = True
@@ -720,6 +822,10 @@ def remove_exact_duplicate_body_paragraphs(doc: Document):
             continue
         norm = normalize_text(para.text).lower()
         if not norm or len(norm) < 80:
+            continue
+        # Never remove source lines or figure captions — multiple images may
+        # legitimately share the same portal URL or a generic caption placeholder.
+        if re.match(r'^\s*(source\s*:|figure\s*\d+)', norm, re.IGNORECASE):
             continue
         if norm in seen:
             first_idx = seen[norm]
@@ -882,8 +988,8 @@ def insert_generated_quizzes_after_units(doc: Document, state):
         page_break_para.add_run().add_break(WD_BREAK.PAGE)
 
         # Quiz heading
-        # Quiz heading
         current_anchor = insert_paragraph_after(page_break_para, f"Quiz – {unit.title}")
+        current_anchor.style = doc.styles["Normal"]
         current_anchor.alignment = WD_ALIGN_PARAGRAPH.LEFT
         if current_anchor.runs:
             current_anchor.runs[0].bold = True
@@ -904,7 +1010,12 @@ def insert_generated_quizzes_after_units(doc: Document, state):
                     current_anchor.runs[0].font.size = Pt(b_size)
 
             # Question
-            current_anchor = insert_paragraph_after(current_anchor, f"Q. {item.question}")
+            current_anchor = insert_paragraph_after(
+                current_anchor,
+                f"Q. {item.question}"
+            )
+
+            current_anchor.style = doc.styles["Normal"]
             current_anchor.alignment = WD_ALIGN_PARAGRAPH.LEFT
             if current_anchor.runs:
                 current_anchor.runs[0].font.name = b_font
@@ -914,6 +1025,7 @@ def insert_generated_quizzes_after_units(doc: Document, state):
             if item.options:
                 for opt in item.options:
                     current_anchor = insert_paragraph_after(current_anchor, f"- {opt}")
+                    current_anchor.style = doc.styles["Normal"]
                     current_anchor.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     if current_anchor.runs:
                         current_anchor.runs[0].font.name = b_font
@@ -922,6 +1034,7 @@ def insert_generated_quizzes_after_units(doc: Document, state):
             # Answer
             if item.answer:
                 current_anchor = insert_paragraph_after(current_anchor, f"Answer: {item.answer}")
+                current_anchor.style = doc.styles["Normal"]
                 current_anchor.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 if current_anchor.runs:
                     current_anchor.runs[0].font.name = b_font
@@ -1019,11 +1132,41 @@ def polish_doc_structure(doc: Document):
     for para in to_remove:
         _remove_paragraph(para)
 
+def _is_quiz_paragraph(text: str) -> bool:
+    if not text:
+        return False
+
+    text = text.strip()
+
+    patterns = [
+        r'^quiz\b',
+        r'^multiple choice',
+        r'^fill in the blank',
+        r'^true or false',
+        r'^two[- ]mark',
+        r'^four[- ]mark',
+
+        r'^q[\.\)]',
+        r'^q\d+[\.\)]',
+
+        r'^\d+[\.\)]\s',
+        r'^[A-D][\.\)]\s',
+
+        r'^answer\s*:',
+        r'^reason\s*:',
+    ]
+
+    return any(
+        re.match(pattern, text, re.IGNORECASE)
+        for pattern in patterns
+    )
 
 def justify_body_paragraphs(doc: Document):
     """
     Apply justified alignment only to substantial body paragraphs.
     Skips headings, images, TOC, centred text, short lines, and list-style content.
+    Explicitly sets LEFT alignment on heading-styled and pseudo-heading paragraphs
+    to override any inherited or incorrectly applied justify.
     """
     # AFTER:
     LIST_PATTERN = re.compile(
@@ -1031,6 +1174,7 @@ def justify_body_paragraphs(doc: Document):
         r'\d+[\.\)]\s'                      # 1. or 1)
         r'|\d+\.[A-Za-z]'                   # 1.If... — inline quiz, no space after dot
         r'|[A-Da-d][\.\)]\s'                # a. or a)
+        r'|[A-D][\.\)]\s'                   # A) or A. — single MCQ option line (e.g. "A) 0")
         r'|[-•·▪▸]\s'                       # bullet symbols
         r'|Step\s+\d+\s*[:\-–]'            # Step 1: or Step 1 -
         r'|Note\s*[:\-–]'                   # Note: or Note -
@@ -1044,51 +1188,119 @@ def justify_body_paragraphs(doc: Document):
         re.IGNORECASE
     )
 
+    # Pattern to detect quiz question lines (e.g. "Q. ...", "Q1. ...", "Q1) ...")
+    # These must keep LEFT alignment, not be justified.
+    QUIZ_QUESTION_PATTERN = re.compile(
+        r'^\s*Q[\.\)]\s'           # Q. or Q)
+        r'|^\s*Q\d+[\.\)]\s',      # Q1. or Q1)
+        re.IGNORECASE
+    )
+
+    # Pattern to detect quiz section subheadings (e.g. "Multiple Choice Questions",
+    # "Fill in the Blanks", "True or False", "Short Answer Questions")
+    QUIZ_SECTION_PATTERN = re.compile(
+        r'^\s*(multiple\s+choice|fill\s+in\s+the\s+blank|true\s+or\s+false|short\s+answer'
+        r'|long\s+answer|descriptive\s+question|match\s+the\s+following|quiz\b)',
+        re.IGNORECASE
+    )
+
     for para in doc.paragraphs:
         style_name = para.style.name if para.style else "Normal"
         style_lower = style_name.lower()
 
-        # Skip headings and TOC
+        # ── Headings (Word heading style) ──────────────────────────────────
+        # Explicitly set LEFT to fix any incorrectly justified headings,
+        # then skip so we never apply JUSTIFY to them.
         if style_lower.startswith("heading") or style_lower.startswith("toc"):
+            if para.alignment not in (WD_ALIGN_PARAGRAPH.CENTER,):
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             continue
-        
-        # Skip pseudo-headings: short paragraphs where every run is bold
-        text_check = para.text.strip()
-        if text_check and len(text_check.split()) <= 15:
-            runs_with_text = [r for r in para.runs if r.text.strip()]
-            if runs_with_text and all(r.bold for r in runs_with_text):
-                continue
 
         # Skip image paragraphs
         has_drawing = bool(para._element.xpath('.//*[local-name()="drawing"]'))
         if has_drawing:
             continue
 
-       # Skip already-aligned paragraphs
+        text_check = para.text.strip()
+
+        # ── Pseudo-headings: bold paragraphs not using a Word heading style ─
+        # Use ANY-bold check (not all-bold) because heading runs can be mixed.
+        # Use <= 20 word limit to catch multi-word headings like
+        # "The Principle of Localization:" that have extra spaces in source doc.
+        # Also explicitly set LEFT on these to repair any justify already applied.
+        if text_check:
+            runs_with_text = [r for r in para.runs if r.text.strip()]
+            has_any_bold = runs_with_text and any(r.bold for r in runs_with_text)
+            # Collapse internal spaces before word-counting so "Fourier    Conjugates:"
+            # isn't counted as many words due to spacing artifacts in source doc.
+            word_count = len(re.sub(r'\s+', ' ', text_check).split())
+            if has_any_bold and word_count <= 20:
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                continue
+
+        # Skip paragraphs with explicit CENTER/RIGHT/DISTRIBUTE alignment
         if para.alignment in (
-            WD_ALIGN_PARAGRAPH.LEFT,
             WD_ALIGN_PARAGRAPH.CENTER,
             WD_ALIGN_PARAGRAPH.RIGHT,
             WD_ALIGN_PARAGRAPH.DISTRIBUTE,
         ):
             continue
 
-        text = para.text.strip()
-
+        text = text_check
+        
+        if _is_quiz_paragraph(text):
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            continue
         # Skip short lines — justifying these causes ugly extra spacing
         if len(text.split()) < 8:
             continue
 
-        # Skip list-style and step-style content
-        if LIST_PATTERN.match(text):
-            continue
-        
-        # Skip inline MCQ lines — contain multiple lettered options on one line
-        if _INLINE_MCQ_PATTERN.search(text):
+        # Quiz/list lines: actively reset to LEFT (not just skip).
+        # Skipping alone leaves any pre-existing JUSTIFY from the original doc intact.
+        # Explicit LEFT ensures the original quiz alignment is always restored.
+        if (
+            LIST_PATTERN.match(text)
+            or _INLINE_MCQ_PATTERN.search(text)
+            or QUIZ_QUESTION_PATTERN.match(text)
+            or QUIZ_SECTION_PATTERN.match(text)
+        ):
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             continue
 
         para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
+def force_quiz_alignment(doc):
+    """
+    Final safety pass.
+    Forces quiz content to LEFT alignment even if a previous
+    formatting step accidentally justified it.
+    """
+
+    QUIZ_SECTION_PATTERN = re.compile(
+        r'^\s*(multiple\s+choice|fill\s+in\s+the\s+blank|true\s+or\s+false|'
+        r'two[- ]mark|four[- ]mark|short\s+answer|long\s+answer|quiz\b)',
+        re.IGNORECASE
+    )
+
+    QUIZ_QUESTION_PATTERN = re.compile(
+        r'^\s*Q[\.\)]\s'
+        r'|^\s*Q\d+[\.\)]\s'
+        r'|^\s*\d+[\.\)]\s'
+        r'|^\s*\d+\.[A-Za-z]'
+        r'|^\s*Question\s+\d+',
+        re.IGNORECASE
+    )
+
+    for para in doc.paragraphs:
+        text = (para.text or "").strip()
+
+        if (
+            _is_quiz_paragraph(text)
+            or QUIZ_SECTION_PATTERN.match(text)
+            or QUIZ_QUESTION_PATTERN.match(text)
+            or _is_list_item(para)
+        ):
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     """
@@ -1109,6 +1321,8 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     12. Normalize styles using document's own dominant font
     """
     doc = copy_docx(original_file)
+    if not getattr(state, "_cached_image_sources", None):
+        _inject_image_issues(state, original_file)
 
     # ── Step 2: Strip ALL comments — Final Fixed must be completely clean ──
     _strip_all_comments(doc)
@@ -1126,8 +1340,12 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     add_missing_summary_headings(doc)
 
     # ── Step 7: Image captions and source links ───────────────────────────
+    # Reuse the same image_sources dict cached by _inject_image_issues so
+    # the Fixed doc and Review Comments doc are guaranteed to be in sync.
     from image_source_finder import find_sources_for_images
-    image_sources = find_sources_for_images(state)
+    if not getattr(state, '_cached_image_sources', None):
+        state._cached_image_sources = find_sources_for_images(state)
+    image_sources = state._cached_image_sources
 
     figure_counter = _get_next_figure_number(doc)
     caption_inserted_at = set()
@@ -1174,6 +1392,9 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
 
     # ── Step 11: Justify ──────────────────────────────────────────────────
     justify_body_paragraphs(doc)
+
+    # ── Step 11.5: Final quiz alignment protection ────────────────────────
+    force_quiz_alignment(doc)
 
     # ── Step 12: Normalize fonts using document's own dominant style ──────
     normalize_styles(doc)
