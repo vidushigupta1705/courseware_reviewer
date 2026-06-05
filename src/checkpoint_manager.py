@@ -42,7 +42,7 @@ def save_checkpoint(state: DocumentState, stage_name: str):
         return
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    path = CHECKPOINT_DIR / f"{state.base_filename}__{stage_name}.json"
+    path = CHECKPOINT_DIR / f"{state.base_filename[:40].strip()}__{stage_name}.json"
 
     payload = state.to_dict()
 
@@ -107,7 +107,7 @@ def _load_generated_visuals(items):
 
 
 def load_checkpoint(base_filename: str, stage_name: str):
-    path = CHECKPOINT_DIR / f"{base_filename}__{stage_name}.json"
+    path = CHECKPOINT_DIR / f"{base_filename[:40].strip()}__{stage_name}.json"
     if not path.exists():
         return None
 
