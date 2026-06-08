@@ -10,7 +10,7 @@ from config import (
 )
 
 
-def _clean_label(text: str, max_len: int = 36) -> str:
+def _clean_label(text: str, max_len: int = 22) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
@@ -83,10 +83,10 @@ def _build_flow_diagram(text: str, out_base: Path):
         nodes = ["Start", "Process", "End"]
 
     dot = Digraph(format="png")
-    dot.attr(rankdir="LR", dpi="96")         # just change 150 → 96
-    dot.attr("graph", fontname="Arial", fontsize="14", size="5.5,7.5")   # add size here
-    dot.attr("node", shape="box", style="rounded", fontname="Arial", fontsize="14", margin="0.3,0.2")
-    dot.attr("edge", fontname="Arial", fontsize="12")
+    dot.attr(rankdir="LR", dpi="180")        
+    dot.attr("graph", fontname="Arial", fontsize="11", size="5.5,7.5")   # add size here
+    dot.attr("node", shape="box", style="rounded", fontname="Arial", fontsize="11", margin="0.3,0.2")
+    dot.attr("edge", fontname="Arial", fontsize="10")
 
     for i, label in enumerate(nodes):
         dot.node(f"n{i}", label)
@@ -104,10 +104,10 @@ def _build_lifecycle_diagram(text: str, out_base: Path):
         nodes = ["Input", "Process", "Output"]
 
     dot = Digraph(format="png")
-    dot.attr(rankdir="LR", dpi="96")         # just change 150 → 96
-    dot.attr("graph", fontname="Arial", fontsize="14", size="5.5,7.5")   # add size here
-    dot.attr("node", shape="ellipse", fontname="Arial", fontsize="14", margin="0.3,0.2")
-    dot.attr("edge", fontname="Arial", fontsize="12")
+    dot.attr(rankdir="LR", dpi="180")       
+    dot.attr("graph", fontname="Arial", fontsize="11", size="5.5,7.5")   # add size here
+    dot.attr("node", shape="ellipse", fontname="Arial", fontsize="11", margin="0.3,0.2")
+    dot.attr("edge", fontname="Arial", fontsize="10")
 
     for i, label in enumerate(nodes):
         dot.node(f"n{i}", label)
@@ -126,10 +126,10 @@ def _build_comparison_diagram(text: str, out_base: Path):
         nodes = ["Option A", "Comparison Point", "Option B"]
 
     dot = Digraph(format="png")
-    dot.attr(rankdir="TB", dpi="96")         # just change 150 → 96
-    dot.attr("graph", fontname="Arial", fontsize="14", size="5.5,7.5")   # add size here
-    dot.attr("node", shape="box", fontname="Arial", fontsize="14", margin="0.3,0.2")
-    dot.attr("edge", fontname="Arial", fontsize="12")
+    dot.attr(rankdir="TB", dpi="180")        
+    dot.attr("graph", fontname="Arial", fontsize="11", size="5.5,7.5")   # add size here
+    dot.attr("node", shape="box", fontname="Arial", fontsize="11", margin="0.3,0.2")
+    dot.attr("edge", fontname="Arial", fontsize="10")
 
     if len(nodes) >= 3:
         dot.node("left", nodes[0])
