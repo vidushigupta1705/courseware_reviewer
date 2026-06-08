@@ -166,6 +166,36 @@ def _strip_all_comments(doc: Document):
 # ─────────────────────────────────────────────────────────────────────────────
 # Style normalization
 # ─────────────────────────────────────────────────────────────────────────────
+def normalize_heading_levels(doc):
+    """
+    IBM heading standard:
+    Heading 1 -> Arial 12 Bold
+    Heading 2+ -> Arial 10 Bold
+    """
+
+    for para in doc.paragraphs:
+
+        if not para.style:
+            continue
+
+        style_name = para.style.name.lower()
+
+        if not style_name.startswith("heading"):
+            continue
+
+        try:
+            level = int(style_name.replace("heading", "").strip())
+        except:
+            continue
+
+        target_size = 12 if level == 1 else 10
+
+        para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+        for run in para.runs:
+            run.font.name = "Arial"
+            run.font.bold = True
+            run.font.size = Pt(target_size)
 
 def normalize_styles(doc: Document):
     """
@@ -218,7 +248,7 @@ def normalize_styles(doc: Document):
                 if abs(run_size - target_size) > 0.5:
                     run.font.size = Pt(target_size)
             if is_heading:
-                run.bold = True
+                continue
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,9 +589,18 @@ def _inject_image_issues(state, original_file: Path = None) -> None:
             if img.nearest_caption_paragraph_index is not None
             else img.paragraph_index
         )
-        source_url    = image_sources.get(img.filename) or "Source: [Add source URL/reference here]"
-        needs_caption = (not img.nearest_caption_text) and (target_idx not in seen_caption)
-        needs_source  = (not img.has_source_link)   and ((target_idx, source_url) not in seen_source)
+        source_url = image_sources.get(img.filename)
+        needs_caption = (
+            not img.nearest_caption_text
+            and target_idx not in seen_caption
+        )
+
+        needs_source = (
+            not img.has_source_link
+            and source_url
+            and "Add source URL/reference here" not in source_url
+            and (target_idx, source_url) not in seen_source
+        )
         if not (needs_caption or needs_source):
             continue
 
@@ -570,9 +609,7 @@ def _inject_image_issues(state, original_file: Path = None) -> None:
 
         if needs_caption:
             msg_parts.append(
-                f"Auto-inserted figure caption placeholder "
-                f"(Figure {figure_counter}): 'Image description/caption to be finalized.'"
-            )
+                f"Image source reference added: '{source_url}'")
             fix_parts.append("Replace the placeholder caption with an accurate figure description.")
             seen_caption.add(target_idx)
             figure_counter += 1
@@ -582,7 +619,9 @@ def _inject_image_issues(state, original_file: Path = None) -> None:
                 "Auto-inserted source URL placeholder: "
                 "'Source: [Add source URL/reference here]'"
             )
-            fix_parts.append("Replace the source placeholder with a verified URL or reference.")
+            fix_parts.append(
+                "Verify that the detected source reference is correct."
+            )
             seen_source.add((target_idx, source_url))
 
         if needs_caption and needs_source:
@@ -642,21 +681,26 @@ def build_review_comments_doc(original_file: Path, state, output_path: Path):
             if img.nearest_caption_paragraph_index is not None
             else img.paragraph_index
         )
-        _img_source_url = image_sources.get(img.filename) or "Source: [Add source URL/reference here]"
+        _img_source_url = image_sources.get(img.filename)
         needs_caption = (not img.nearest_caption_text) and (target_idx not in caption_inserted_at)
-        needs_source  = (not img.has_source_link) and ((target_idx, _img_source_url) not in source_inserted_at)
-
+        needs_source = (
+                (not img.has_source_link)
+                and _img_source_url
+                and "Add source URL/reference here" not in _img_source_url
+                and ((target_idx, _img_source_url) not in source_inserted_at)
+            )      
+         
         if needs_caption or needs_source:
             figure_text = (
-                    f"[REVIEW NOTE] Missing Figure Caption\n"
-                    f"Figure {figure_counter}: Image description/caption to be finalized."
+                    
+                    f"Figure {figure_counter}"
                     if needs_caption else None
                 )
             source_text = (
-                    f"[REVIEW NOTE] Missing Image Source\n"
-                    f"{_img_source_url}"
-                    if needs_source else None
-                )
+                
+                f"{_img_source_url}"
+                if needs_source else None
+            )
 
             _append_caption_then_source(doc, target_idx, figure_text, source_text)
 
@@ -1359,13 +1403,13 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
             if img.nearest_caption_paragraph_index is not None
             else img.paragraph_index
         )
-        _img_source_url = image_sources.get(img.filename) or "Source: [Add source URL/reference here]"
+        _img_source_url = image_sources.get(img.filename)
         needs_caption = (not img.nearest_caption_text) and (target_idx not in caption_inserted_at)
         needs_source  = (not img.has_source_link)    and ((target_idx, _img_source_url) not in source_inserted_at)
 
         if needs_caption or needs_source:
             figure_text = (
-                f"Figure {figure_counter}: Image description/caption to be finalized."
+                f"Figure {figure_counter}"
                 if needs_caption else None
             )
             source_text = _img_source_url if needs_source else None
@@ -1397,6 +1441,7 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     force_quiz_alignment(doc)
 
     # ── Step 12: Normalize fonts using document's own dominant style ──────
+    normalize_heading_levels(doc)
     normalize_styles(doc)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
