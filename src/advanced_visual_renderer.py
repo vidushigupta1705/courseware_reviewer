@@ -18,23 +18,23 @@ def _render_graphviz_visual(spec, out_base: Path):
 
     if spec.visual_type in {"architecture_diagram", "deployment_diagram"}:
         dot.attr(rankdir="TB")
-        dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
+        dot.attr("graph", size="5.5,7.5", dpi="180")    # ← add
         dot.attr("node", shape="box", style="rounded,filled")
     elif spec.visual_type == "sequence_diagram":
         dot.attr(rankdir="LR")
-        dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
+        dot.attr("graph", size="5.5,7.5", dpi="180")    # ← add
         dot.attr("node", shape="box")
     elif spec.visual_type == "comparison_visual":
         dot.attr(rankdir="TB")
-        dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
+        dot.attr("graph", size="5.5,7.5", dpi="180")    # ← add
         dot.attr("node", shape="box")
     elif spec.visual_type == "lifecycle_diagram":
         dot.attr(rankdir="LR")
-        dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
+        dot.attr("graph", size="5.5,7.5", dpi="180")    # ← add
         dot.attr("node", shape="ellipse")
     else:
         dot.attr(rankdir="LR")
-        dot.attr("graph", size="5.5,7.5", dpi="96")    # ← add
+        dot.attr("graph", size="5.5,7.5", dpi="180")    # ← add
         dot.attr("node", shape="box", style="rounded")
 
     for node in spec.nodes:
@@ -90,8 +90,8 @@ def _render_concept_visual(spec, out_base: Path):
         draw.text((110, 790), spec.annotations[0], fill="black", font=body_font)
 
     out_path = str(out_base) + ".png"
-    img = img.resize((528, 297), Image.LANCZOS)    # 5.5in × 3.09in @ 96dpi
-    img.save(out_path, dpi=(96, 96))
+    img = img.resize((528, 297), Image.LANCZOS)    # 5.5in × 3.09in @180dpi
+    img.save(out_path, dpi=(180,180))
     return out_path
 
 
