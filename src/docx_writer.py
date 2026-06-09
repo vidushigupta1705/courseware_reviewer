@@ -169,8 +169,8 @@ def _strip_all_comments(doc: Document):
 def normalize_heading_levels(doc):
     """
     IBM heading standard:
-    Heading 1 -> Arial 12 Bold
-    Heading 2+ -> Arial 10 Bold
+    Heading 1 & 2 -> Arial 12 Bold
+    Heading 3+ -> Arial 10 Bold
     """
 
     for para in doc.paragraphs:
