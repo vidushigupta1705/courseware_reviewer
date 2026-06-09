@@ -188,7 +188,7 @@ def normalize_heading_levels(doc):
         except:
             continue
 
-        target_size = 12 if level == 1 else 10
+        target_size = 12 if level <=2 else 10
 
         para.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
