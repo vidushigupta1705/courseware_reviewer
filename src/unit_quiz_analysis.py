@@ -24,6 +24,16 @@ _SKIP_AS_UNIT = {
     "what you'll learn", "at a glance", "overview",
 }
 
+# Back-matter section titles (after stripping a trailing "— Unit N" /
+# "- Chapter N" suffix) that should never anchor a quiz unit, even though
+# they contain a chapter keyword like "Unit" in that suffix.
+_BACK_MATTER_KEYWORDS = {
+    "glossary", "glossary of key terms",
+    "references", "references and further reading",
+    "further reading", "bibliography", "appendix",
+    "appendices", "index",
+}
+
 QUIZ_PATTERNS = [
     r"\bquiz\b",
     r"\bmcq\b",
@@ -35,6 +45,13 @@ QUIZ_PATTERNS = [
     r"\breview questions\b",
     r"\bpractice questions\b",
     r"\bcheck your understanding\b",
+    # "Assessment" as a standalone section title (e.g. "Assessment",
+    # "Unit Assessment", "Assessment Questions:") — anchored to the WHOLE
+    # line, not a bare \bassessment\b substring. A bare substring would
+    # also match incidental uses like a title-page tagline ("Assessment
+    # Included") or a sentence mentioning assessment in passing, which
+    # are not quiz sections and must not trigger a false positive.
+    r"^\s*(unit\s+|chapter\s+|module\s+|self[- ])?assessment\s*[:\-]?\s*(questions?)?\s*$",
 ]
 
 
@@ -62,12 +79,20 @@ def _has_topic_keyword(text: str) -> bool:
 def _is_nav_heading(text: str) -> bool:
     """
     Returns True if this heading is a structural navigation element
-    (agenda, TOC, objectives, etc.) that should never anchor a quiz unit.
+    (agenda, TOC, objectives, etc.) or back-matter (glossary, references)
+    that should never anchor a quiz unit.
     Strips leading numbering before matching so '1. Agenda' is caught too.
     """
     norm = _norm(text).lower()
     norm = re.sub(r"^\d+[\.\d]*\s*", "", norm).strip()
-    return norm in _SKIP_AS_UNIT
+    if norm in _SKIP_AS_UNIT:
+        return True
+    # Back-matter headings often end with "— Unit N" / "- Unit N" which
+    # would otherwise be mistaken for a real chapter/unit boundary because
+    # they contain a chapter keyword. Check independent of trailing
+    # "Unit N" / "Chapter N" suffixes.
+    stripped = re.sub(r"[\u2013\u2014\-:]\s*(unit|chapter|module|lesson)\s+\d+\s*$", "", norm).strip()
+    return stripped in _BACK_MATTER_KEYWORDS
 
 
 def _matches_numbered_chapter_pattern(text: str) -> bool:
