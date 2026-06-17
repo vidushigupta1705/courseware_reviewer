@@ -29,6 +29,28 @@ from utils import clean_spacing, normalize_text
 # Absolute ceiling for any inserted image — safe for A4 and Letter with standard margins
 MAX_IMAGE_WIDTH_INCHES = 6.0
 
+# Heading font-size standard (pt), keyed by heading level.
+# Heading 1 -> 12pt, Heading 2 -> 10pt, Heading 3 (and deeper) -> 10pt.
+HEADING_SIZE_BY_LEVEL = {1: 12, 2: 10, 3: 10}
+DEFAULT_HEADING_SIZE = 10  # used for any heading level beyond 3
+
+# Font size (pt) applied to bold "pseudo-headings" — paragraphs that are
+# NOT a real Word Heading style but function as one visually (bold,
+# short, standalone line, e.g. a title-page line or an in-body bold
+# label). Applies document-wide, independent of HEADING_SIZE_BY_LEVEL,
+# which only governs real Heading 1/2/3 styled paragraphs.
+PSEUDO_HEADING_SIZE_PT = 14
+PSEUDO_HEADING_MAX_WORDS = 20
+
+# Alignments that must NEVER be overwritten by automated formatting passes.
+# A paragraph that already has one of these is considered "intentionally
+# aligned" and is left exactly as-is.
+PRESERVED_ALIGNMENTS = (
+    WD_ALIGN_PARAGRAPH.CENTER,
+    WD_ALIGN_PARAGRAPH.RIGHT,
+    WD_ALIGN_PARAGRAPH.DISTRIBUTE,
+)
+
 _INLINE_MCQ_PATTERN = re.compile(
     r'[A-D][)\.].*[A-D][)\.].*[A-D][\.\)]',
     re.IGNORECASE
@@ -168,9 +190,17 @@ def _strip_all_comments(doc: Document):
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_heading_levels(doc):
     """
-    IBM heading standard:
-    Heading 1 & 2 -> Arial 12 Bold
-    Heading 3+ -> Arial 10 Bold
+    IBM heading font-size standard:
+      Heading 1 -> 12 pt
+      Heading 2 -> 10 pt
+      Heading 3 (and any deeper level) -> 10 pt
+    All headings: Arial, Bold.
+
+    Alignment rule: a heading that is ALREADY aligned (CENTER, RIGHT, or
+    DISTRIBUTE) is left exactly as it is — never forced to LEFT. Only a
+    heading with NO explicit alignment (i.e. broken/inherited/missing) is
+    set to LEFT. This guarantees intentional title-page centering (e.g. a
+    cover-page title) is never silently changed.
     """
 
     for para in doc.paragraphs:
@@ -185,23 +215,29 @@ def normalize_heading_levels(doc):
 
         try:
             level = int(style_name.replace("heading", "").strip())
-        except:
+        except Exception:
             continue
 
-        target_size = 12 if level <=2 else 10
+        target_size = HEADING_SIZE_BY_LEVEL.get(level, DEFAULT_HEADING_SIZE)
 
-        para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        # Preserve any already-intentional alignment; only fix missing/broken alignment.
+        if para.alignment not in PRESERVED_ALIGNMENTS:
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         for run in para.runs:
             run.font.name = "Arial"
             run.font.bold = True
             run.font.size = Pt(target_size)
 
+
 def normalize_styles(doc: Document):
     """
     Fix only paragraphs whose font/size is inconsistent with the document's
     own dominant style. Does NOT force Arial — uses the document's own norm.
     Skips TOC entries entirely.
+    Never touches heading paragraphs' size — normalize_heading_levels already
+    enforces the IBM 12/10/10 standard and must remain the single source of
+    truth for heading sizes.
     """
     dom_heading_font, dom_heading_size = _get_dominant_font(doc, is_heading=True)
     dom_body_font, dom_body_size = _get_dominant_font(doc, is_heading=False)
@@ -244,11 +280,72 @@ def normalize_styles(doc: Document):
 
             if run_font and target_font and run_font != target_font:
                 run.font.name = target_font
-            if run_size is not None and target_size is not None:
-                if abs(run_size - target_size) > 0.5:
-                    run.font.size = Pt(target_size)
+
+            # Heading sizes are owned exclusively by normalize_heading_levels
+            # (12/10/10 IBM standard) — never override them here.
             if is_heading:
                 continue
+
+            if run_size is not None and target_size is not None:
+                # Never shrink a run that's LARGER than the dominant body
+                # size. A run far above the body-text norm is, by
+                # definition, intentional display/title text (e.g. a
+                # cover-page title at 26pt while body text is 8.5pt) — not
+                # an inconsistency to "fix". Only correct runs that are
+                # close to, but not exactly matching, the dominant size
+                # (e.g. an 8pt typo next to 8.5pt body text), or runs
+                # smaller than the dominant size that look like accidental
+                # shrinkage rather than intentional small print.
+                if run_size > target_size:
+                    continue
+                if abs(run_size - target_size) > 0.5:
+                    run.font.size = Pt(target_size)
+
+
+def normalize_pseudo_heading_sizes(doc: Document) -> None:
+    """
+    Set every bold "pseudo-heading" paragraph to PSEUDO_HEADING_SIZE_PT
+    (14pt), document-wide.
+
+    A pseudo-heading is a paragraph that is NOT a real Word Heading style
+    but visually functions as one: it has at least one bold run and is
+    short (<= PSEUDO_HEADING_MAX_WORDS words). This is the exact same
+    detection rule already used by justify_body_paragraphs() to decide
+    which lines get LEFT alignment instead of JUSTIFY — reused here so
+    sizing and alignment treat the same set of paragraphs consistently.
+
+    This includes title-page lines (e.g. the cover title, "Theory
+    Courseware", "Topics Covered") and any other bold standalone label
+    throughout the body (e.g. "Unit 1 — Summary", a bolded glossary term
+    lead-in). Real Heading 1/2/3 styled paragraphs are untouched here —
+    they are governed exclusively by normalize_heading_levels()'s
+    12/10/10pt rule. TOC entries are also skipped.
+
+    Must run AFTER normalize_styles(), since normalize_styles() only
+    skips shrinking runs already larger than the body-text norm — it does
+    not raise smaller pseudo-headings up to 14pt. This function is the
+    single source of truth for pseudo-heading size and runs last so its
+    14pt value is never overwritten by an earlier step.
+    """
+    for para in doc.paragraphs:
+        style_name = para.style.name if para.style else "Normal"
+        style_lower = style_name.lower()
+
+        if style_lower.startswith("heading") or style_lower.startswith("toc"):
+            continue
+
+        text = para.text.strip()
+        if not text:
+            continue
+
+        runs_with_text = [r for r in para.runs if r.text.strip()]
+        has_any_bold = runs_with_text and any(r.bold for r in runs_with_text)
+        word_count = len(re.sub(r'\s+', ' ', text).split())
+
+        if has_any_bold and word_count <= PSEUDO_HEADING_MAX_WORDS:
+            for run in para.runs:
+                if run.text.strip():
+                    run.font.size = Pt(PSEUDO_HEADING_SIZE_PT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,7 +381,6 @@ def clean_doc_spacing(doc: Document):
         if cleaned == para.text.strip():
             continue
 
-        is_heading = False  # headings are skipped above
         target_font = dom_body_font
         target_size = dom_body_size
 
@@ -936,20 +1032,51 @@ def apply_rewrites_to_doc(doc: Document, state):
 
 
 def _find_unit_end_in_doc(doc: Document, unit_title: str) -> Optional[int]:
+    """
+    Find the paragraph index at which a unit's content ends in the live
+    document, so a generated quiz can be inserted immediately after it —
+    i.e. at the true END of the unit, never near the start.
+
+    Drift-safe: re-locates the heading by text match in the live document
+    instead of trusting a pre-recorded index, since earlier pipeline steps
+    (rewrites, caption insertion, duplicate removal) can shift indices.
+    """
     unit_title_norm = unit_title.strip().lower()
     unit_heading_idx = None
     unit_level = None
 
+    # A bold short line, or a same-level Word heading, only counts as a
+    # NEXT-unit boundary if it actually looks like a chapter/unit/module/
+    # lesson title (e.g. "Unit 2: ...") AND carries a DIFFERENT number than
+    # the current unit. Without the number check, in-unit labels like
+    # "Unit 1 — Summary" would be mistaken for the start of the next unit.
+    # Without the keyword check, any incidental bold line ("Topics
+    # Covered", a key term, a callout label) would be mistaken for a
+    # boundary too — both truncate the unit early and place the quiz near
+    # the top of the document instead of at the true end.
+    CHAPTER_TITLE_PATTERN = re.compile(
+        r'^(chapter|unit|module|lesson)\s+(\d+|[ivxIVX]+)\b', re.IGNORECASE
+    )
+    current_unit_number_match = re.search(r'\b(\d+|[ivxIVX]+)\b', unit_title)
+    current_unit_number = current_unit_number_match.group(1).lower() if current_unit_number_match else None
+
+    def _is_next_unit_title(text: str) -> bool:
+        m = CHAPTER_TITLE_PATTERN.match(text)
+        if not m:
+            return False
+        candidate_number = m.group(2).lower()
+        # Same number as the current unit -> it's an in-unit label
+        # ("Unit 1 — Summary"), not the next unit.
+        return candidate_number != current_unit_number
+
+    # Find the heading text in the live document. Only match real
+    # Word-styled headings (Heading 1/2/3...) — never bold pseudo-headings —
+    # so an earlier cover-page repeat of the same title text isn't mistaken
+    # for the real section heading.
     for i, para in enumerate(doc.paragraphs):
         style_name = (para.style.name if para.style else "").lower()
         is_word_heading = style_name.startswith("heading")
-        is_bold_heading = (
-            bool(para.text.strip())
-            and len(para.text.strip().split()) <= 12
-            and bool(para.runs)
-            and all(r.bold for r in para.runs if r.text.strip())
-        )
-        if not (is_word_heading or is_bold_heading):
+        if not is_word_heading:
             continue
         if para.text.strip().lower() == unit_title_norm:
             unit_heading_idx = i
@@ -966,9 +1093,10 @@ def _find_unit_end_in_doc(doc: Document, unit_title: str) -> Optional[int]:
         para_i = doc.paragraphs[i]
         style_name = (para_i.style.name if para_i.style else "").lower()
         is_word_heading = style_name.startswith("heading")
+        text_i = para_i.text.strip()
         is_bold_heading = (
-            bool(para_i.text.strip())
-            and len(para_i.text.strip().split()) <= 12
+            bool(text_i)
+            and len(text_i.split()) <= 12
             and bool(para_i.runs)
             and all(r.bold for r in para_i.runs if r.text.strip())
         )
@@ -976,9 +1104,19 @@ def _find_unit_end_in_doc(doc: Document, unit_title: str) -> Optional[int]:
             parts = style_name.split()
             if len(parts) >= 2 and parts[1].isdigit():
                 level = int(parts[1])
-                if unit_level is None or level <= unit_level:
+                # Same/shallower heading level alone isn't reliable — some
+                # documents use Heading 1 for both the unit title AND its
+                # numbered subsections (1.1, 1.2, 1.3...). Only treat it as
+                # the start of the NEXT unit if it's strictly shallower, or
+                # it's the same level but actually reads like a new,
+                # DIFFERENT-numbered chapter/unit title — not a subsection
+                # heading like "1.1 Introduction..." and not an in-unit
+                # label like "Unit 1 — Summary".
+                if unit_level is None or level < unit_level:
                     return i - 1
-        elif is_bold_heading:
+                if level == unit_level and _is_next_unit_title(text_i):
+                    return i - 1
+        elif is_bold_heading and _is_next_unit_title(text_i):
             return i - 1
 
     return len(doc.paragraphs) - 1
@@ -986,7 +1124,14 @@ def _find_unit_end_in_doc(doc: Document, unit_title: str) -> Optional[int]:
 
 def insert_generated_quizzes_after_units(doc: Document, state):
     """
-    Insert generated quiz at the end of each unit that is missing one.
+    Insert exactly one generated quiz at the end of each unit that is
+    missing one.
+
+    - If a unit already has a quiz (unit.quiz_present is True), nothing is
+      inserted for that unit — no duplicate is ever created.
+    - If a unit has no quiz, exactly one quiz is generated and inserted at
+      the TRUE end of that unit (see _find_unit_end_in_doc), never near
+      the start.
 
     DRIFT-SAFE: Uses heading text match to find position in the live document
     instead of the pre-recorded end_paragraph_index which drifts after rewrites
@@ -1208,11 +1353,17 @@ def _is_quiz_paragraph(text: str) -> bool:
 def justify_body_paragraphs(doc: Document):
     """
     Apply justified alignment only to substantial body paragraphs.
-    Skips headings, images, TOC, centred text, short lines, and list-style content.
-    Explicitly sets LEFT alignment on heading-styled and pseudo-heading paragraphs
-    to override any inherited or incorrectly applied justify.
+    Skips headings, images, TOC, centred/right/distributed text, short
+    lines, and list-style content.
+
+    Alignment rule (applies everywhere in this function): a paragraph that
+    is ALREADY intentionally aligned — CENTER, RIGHT, or DISTRIBUTE — is
+    NEVER changed. Only paragraphs with broken/missing/incorrect alignment
+    (i.e. anything else, including stray JUSTIFY on a heading or list line)
+    get forced to LEFT. This guarantees pre-existing centered titles, right-
+    aligned captions, etc. are always preserved exactly as the author set
+    them, while genuinely broken alignment is repaired.
     """
-    # AFTER:
     LIST_PATTERN = re.compile(
         r'^\s*('
         r'\d+[\.\)]\s'                      # 1. or 1)
@@ -1252,11 +1403,12 @@ def justify_body_paragraphs(doc: Document):
         style_name = para.style.name if para.style else "Normal"
         style_lower = style_name.lower()
 
-        # ── Headings (Word heading style) ──────────────────────────────────
-        # Explicitly set LEFT to fix any incorrectly justified headings,
-        # then skip so we never apply JUSTIFY to them.
+        # ── Headings (Word heading style) and TOC ───────────────────────────
+        # Preserve any already-intentional alignment (CENTER/RIGHT/DISTRIBUTE).
+        # Only force LEFT when alignment is missing or genuinely broken
+        # (e.g. accidentally JUSTIFY).
         if style_lower.startswith("heading") or style_lower.startswith("toc"):
-            if para.alignment not in (WD_ALIGN_PARAGRAPH.CENTER,):
+            if para.alignment not in PRESERVED_ALIGNMENTS:
                 para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             continue
 
@@ -1271,7 +1423,8 @@ def justify_body_paragraphs(doc: Document):
         # Use ANY-bold check (not all-bold) because heading runs can be mixed.
         # Use <= 20 word limit to catch multi-word headings like
         # "The Principle of Localization:" that have extra spaces in source doc.
-        # Also explicitly set LEFT on these to repair any justify already applied.
+        # Same preservation rule as real headings: don't touch an existing
+        # intentional CENTER/RIGHT/DISTRIBUTE alignment.
         if text_check:
             runs_with_text = [r for r in para.runs if r.text.strip()]
             has_any_bold = runs_with_text and any(r.bold for r in runs_with_text)
@@ -1279,19 +1432,17 @@ def justify_body_paragraphs(doc: Document):
             # isn't counted as many words due to spacing artifacts in source doc.
             word_count = len(re.sub(r'\s+', ' ', text_check).split())
             if has_any_bold and word_count <= 20:
-                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                if para.alignment not in PRESERVED_ALIGNMENTS:
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 continue
 
-        # Skip paragraphs with explicit CENTER/RIGHT/DISTRIBUTE alignment
-        if para.alignment in (
-            WD_ALIGN_PARAGRAPH.CENTER,
-            WD_ALIGN_PARAGRAPH.RIGHT,
-            WD_ALIGN_PARAGRAPH.DISTRIBUTE,
-        ):
+        # Skip paragraphs with explicit CENTER/RIGHT/DISTRIBUTE alignment —
+        # never touch intentional alignment anywhere in this function.
+        if para.alignment in PRESERVED_ALIGNMENTS:
             continue
 
         text = text_check
-        
+
         if _is_quiz_paragraph(text):
             para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             continue
@@ -1317,7 +1468,11 @@ def force_quiz_alignment(doc):
     """
     Final safety pass.
     Forces quiz content to LEFT alignment even if a previous
-    formatting step accidentally justified it.
+    formatting step accidentally justified it. Quiz structural lines
+    (questions, options, answers) are never legitimately CENTER/RIGHT in
+    this document type, so this targeted override is intentional and does
+    not violate the general "never touch intentional alignment" rule used
+    elsewhere — it only matches narrow, structurally-identifiable quiz syntax.
     """
 
     QUIZ_SECTION_PATTERN = re.compile(
@@ -1346,6 +1501,149 @@ def force_quiz_alignment(doc):
         ):
             para.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Table of Contents
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _document_has_toc(doc: Document) -> bool:
+    """Return True if the document already contains a Table of Contents."""
+    for para in doc.paragraphs:
+        style_name = (para.style.name if para.style else "").lower()
+        # TOC-styled paragraphs
+        if style_name.startswith("toc"):
+            return True
+        # Literal heading text
+        text_lower = para.text.strip().lower()
+        if text_lower in ("table of contents", "contents"):
+            return True
+    # Raw TOC field in XML
+    body_xml = doc.element.body.xml
+    if "TOC" in body_xml and "instrText" in body_xml:
+        if re.search(r'<w:instrText[^>]*>\s*TOC\b', body_xml):
+            return True
+    return False
+
+
+def _find_toc_insertion_point(doc: Document) -> int:
+    """
+    Return the index of the first real Heading 1 paragraph (after the title page).
+    The TOC will be inserted immediately before this paragraph.
+    Falls back to index 0 if no Heading 1 is found.
+    """
+    for i, para in enumerate(doc.paragraphs):
+        style_name = (para.style.name if para.style else "").lower()
+        if style_name == "heading 1" and para.text.strip():
+            return i
+    return 0
+
+
+def _insert_toc_field(doc: Document, before_index: int) -> None:
+    """
+    Insert a TOC heading + real Word TOC field + page break immediately before
+    the paragraph at *before_index*.  The TOC field auto-populates headings 1–3
+    with hyperlinks and page numbers when the user opens the file in Word and
+    accepts the 'Update Field' prompt (or presses F9 / Ctrl+A, F9). Combined
+    with _force_update_fields_on_open, Word also rebuilds it automatically on open.
+    """
+    h_font = REQUIRED_HEADING_FONT or "Arial"
+    h_size = HEADING_SIZE_BY_LEVEL.get(1, REQUIRED_HEADING_SIZE_PT)
+
+    anchor = doc.paragraphs[before_index]
+
+    # ── 1. "Table of Contents" heading paragraph ───────────────────────────
+    toc_heading_p = OxmlElement("w:p")
+    anchor._p.addprevious(toc_heading_p)
+    toc_heading_para = Paragraph(toc_heading_p, anchor._parent)
+    try:
+        toc_heading_para.style = doc.styles["Heading 1"]
+    except KeyError:
+        pass
+    run = toc_heading_para.add_run("Table of Contents")
+    run.font.name = h_font
+    run.font.size = Pt(h_size)
+    run.bold = True
+
+    # ── 2. Paragraph containing the TOC field ─────────────────────────────
+    toc_para_p = OxmlElement("w:p")
+    toc_heading_p.addnext(toc_para_p)
+
+    r_begin = OxmlElement("w:r")
+    fc_begin = OxmlElement("w:fldChar")
+    fc_begin.set(qn("w:fldCharType"), "begin")
+    fc_begin.set(qn("w:dirty"), "true")   # marks field as stale → Word updates on open
+    r_begin.append(fc_begin)
+
+    r_instr = OxmlElement("w:r")
+    instr = OxmlElement("w:instrText")
+    instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    instr.text = ' TOC \\o "1-3" \\h \\z \\u \\n '
+    r_instr.append(instr)
+
+    r_sep = OxmlElement("w:r")
+    fc_sep = OxmlElement("w:fldChar")
+    fc_sep.set(qn("w:fldCharType"), "separate")
+    r_sep.append(fc_sep)
+
+    r_end = OxmlElement("w:r")
+    fc_end = OxmlElement("w:fldChar")
+    fc_end.set(qn("w:fldCharType"), "end")
+    r_end.append(fc_end)
+
+    toc_para_p.extend([r_begin, r_instr, r_sep, r_end])
+
+    # ── 3. Page break paragraph after the TOC field ───────────────────────
+    break_p = OxmlElement("w:p")
+    toc_para_p.addnext(break_p)
+    break_para = Paragraph(break_p, anchor._parent)
+    break_para.add_run().add_break(WD_BREAK.PAGE)
+
+
+def _force_update_fields_on_open(output_path: Path) -> None:
+    """
+    Inject <w:updateFields w:val="true"/> into word/settings.xml so Word
+    automatically rebuilds all fields (including the TOC) the moment the
+    file is opened — no manual right-click or F9 needed.
+    """
+    import io
+    import zipfile as _zipfile
+
+    with _zipfile.ZipFile(str(output_path), 'r') as zin:
+        files = {name: zin.read(name) for name in zin.namelist()}
+
+    if "word/settings.xml" not in files:
+        return
+
+    settings_xml = files["word/settings.xml"].decode("utf-8")
+    if "w:updateFields" not in settings_xml:
+        settings_xml = re.sub(
+            r'(<w:settings\b[^>]*>)',
+            r'\1<w:updateFields w:val="true"/>',
+            settings_xml,
+            count=1,
+        )
+        files["word/settings.xml"] = settings_xml.encode("utf-8")
+
+        buf = io.BytesIO()
+        with _zipfile.ZipFile(buf, 'w', _zipfile.ZIP_DEFLATED) as zout:
+            for name, data in files.items():
+                zout.writestr(name, data)
+        output_path.write_bytes(buf.getvalue())
+
+
+def add_missing_table_of_contents(doc: Document) -> None:
+    """
+    Public entry point.  No-ops if a TOC already exists; otherwise inserts
+    a Heading 1 'Table of Contents' + a real Word TOC field (\\o 1-3 \\h \\z \\u)
+    + a page break, placed immediately before the first Heading 1 content paragraph.
+    """
+    if _document_has_toc(doc):
+        return
+    insertion_idx = _find_toc_insertion_point(doc)
+    if insertion_idx >= len(doc.paragraphs):
+        return
+    _insert_toc_field(doc, insertion_idx)
+
+
 def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     """
     Build the Final Fixed document.
@@ -1358,11 +1656,13 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     5. Apply LLM rewrites (in-place)
     6. Add missing summary headings
     7. Add missing image captions and source links
-    8. Insert generated quizzes at unit ends (drift-safe)
+    8. Insert generated quizzes at unit ends (drift-safe, one per unit, only if missing)
     9. Insert advanced visuals / diagrams (page-width capped, centred)
     10. Polish structure (remove excess blanks)
-    11. Justify body paragraphs
-    12. Normalize styles using document's own dominant font
+    11. Justify body paragraphs (never overriding intentional CENTER/RIGHT/DISTRIBUTE)
+    12. Normalize styles and heading sizes (Heading 1 = 12pt, Heading 2 = 10pt, Heading 3 = 10pt, bold pseudo-headings = 14pt)
+    13. Insert Table of Contents if missing
+    14. Force Word to auto-update fields (TOC page numbers) on open
     """
     doc = copy_docx(original_file)
     if not getattr(state, "_cached_image_sources", None):
@@ -1422,7 +1722,7 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
             if needs_source:
                 source_inserted_at.add((target_idx, _img_source_url))
 
-    # ── Step 8: Quizzes (drift-safe) ──────────────────────────────────────
+    # ── Step 8: Quizzes (drift-safe, one per unit, only if missing) ───────
     insert_generated_quizzes_after_units(doc, state)
 
     # ── Step 9: Visuals / diagrams (page-width capped, centred) ──────────
@@ -1434,15 +1734,22 @@ def build_final_fixed_doc(original_file: Path, state, output_path: Path):
     # ── Step 10: Polish ───────────────────────────────────────────────────
     polish_doc_structure(doc)
 
-    # ── Step 11: Justify ──────────────────────────────────────────────────
+    # ── Step 11: Justify (preserves intentional CENTER/RIGHT/DISTRIBUTE) ──
     justify_body_paragraphs(doc)
 
     # ── Step 11.5: Final quiz alignment protection ────────────────────────
     force_quiz_alignment(doc)
 
-    # ── Step 12: Normalize fonts using document's own dominant style ──────
+    # ── Step 12: Normalize heading sizes (12/10/10) and document fonts ────
     normalize_heading_levels(doc)
     normalize_styles(doc)
+    normalize_pseudo_heading_sizes(doc)
+
+    # ── Step 13: Insert TOC if missing ───────────────────────────────────
+    add_missing_table_of_contents(doc)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
+
+    # ── Step 14: Force Word to auto-update TOC on open ───────────────────
+    _force_update_fields_on_open(output_path)
