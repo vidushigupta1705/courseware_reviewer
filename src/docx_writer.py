@@ -12,6 +12,8 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, Emu
 from docx.text.paragraph import Paragraph
 
+from PIL import Image as _PILImage
+
 from config import (
     REQUIRED_HEADING_FONT,
     REQUIRED_HEADING_SIZE_PT,
@@ -28,6 +30,15 @@ from utils import clean_spacing, normalize_text
 
 # Absolute ceiling for any inserted image — safe for A4 and Letter with standard margins
 MAX_IMAGE_WIDTH_INCHES = 6.0
+# Absolute ceiling on HEIGHT for any inserted image. Without this, a
+# naturally tall/narrow diagram (e.g. a vertical flowchart) gets its
+# width forced to a fixed value and its height auto-scales proportionally
+# to preserve aspect ratio — which can stretch it to 20-30+ inches tall,
+# spanning many pages on its own. A typical content page has roughly
+# 9-9.5in of usable vertical space (Letter/A4 minus margins, header,
+# footer); capping height to a safe fraction of that keeps any single
+# diagram from dominating multiple pages.
+MAX_IMAGE_HEIGHT_INCHES = 4.5
 
 # Heading font-size standard (pt), keyed by heading level.
 # Heading 1 -> 12pt, Heading 2 -> 10pt, Heading 3 (and deeper) -> 10pt.
@@ -130,10 +141,84 @@ def _safe_image_width(doc: Document, requested_inches: float) -> Inches:
     """
     Return an Inches value that fits within the page body width.
     Never exceeds the usable page area regardless of what the caller requests.
+
+    NOTE: this only caps width. Setting width alone on a naturally tall/
+    narrow image (low width:height aspect ratio) causes python-docx to
+    scale height up proportionally with no limit, which can produce a
+    single image 20-30+ inches tall. Use _safe_image_dimensions() instead
+    wherever the image's native aspect ratio is unknown or could be
+    extreme — it caps both width AND height, never width alone.
     """
     body_width = _get_page_body_width_inches(doc)
     capped = min(requested_inches, body_width, MAX_IMAGE_WIDTH_INCHES)
     return Inches(capped)
+
+
+# DPI that Graphviz renders generated diagrams at (see advanced_visual_renderer.py
+# and diagram_generator.py, both call dot.attr(..., dpi="180")). Used to convert
+# a diagram's native pixel size back to its TRUE physical size as the renderer
+# intended, rather than always stretching every diagram to one fixed width.
+DIAGRAM_RENDER_DPI = 180
+
+
+def _safe_image_dimensions(doc: Document, image_path: str, requested_width_inches: float):
+    """
+    Return (width, height) as Inches objects, sized PROPORTIONALLY to the
+    image's actual content rather than always stretched to a fixed target
+    width.
+
+    Why: forcing every diagram to the same target width (e.g. 5.5in)
+    regardless of its real complexity means a simple 3-node diagram and a
+    dense 9-node diagram both render at an identical size — and worse, a
+    naturally tall/narrow diagram (e.g. a 7-step vertical flowchart) gets
+    its height inflated to match, producing a multi-page-tall image for
+    content that was only ever meant to be small.
+
+    Instead:
+    1. Start from the diagram's TRUE native size — its pixel dimensions
+       divided by DIAGRAM_RENDER_DPI, the resolution Graphviz actually
+       rendered it at. This is the size the renderer intended.
+    2. Only ever SCALE DOWN from that native size, never up — if the
+       diagram is already smaller than the page bounds, it stays exactly
+       that size rather than being stretched to fill a target width.
+    3. If the native size exceeds either the page body width or
+       MAX_IMAGE_HEIGHT_INCHES, scale down uniformly (preserving aspect
+       ratio) by whichever dimension is more constraining, so oversized
+       diagrams still shrink to fit the page.
+
+    Falls back to width-only sizing (scaled down to requested_width_inches,
+    no height cap) if the image's native dimensions can't be read.
+    """
+    max_width = min(_get_page_body_width_inches(doc), MAX_IMAGE_WIDTH_INCHES, requested_width_inches)
+
+    try:
+        with _PILImage.open(image_path) as img:
+            native_w_px, native_h_px = img.size
+        if native_w_px <= 0 or native_h_px <= 0:
+            raise ValueError("non-positive native image dimensions")
+    except Exception:
+        # Can't read native dimensions — fall back to the previous
+        # width-only behavior rather than failing the whole insertion.
+        return Inches(max_width), None
+
+    native_width_in = native_w_px / DIAGRAM_RENDER_DPI
+    native_height_in = native_h_px / DIAGRAM_RENDER_DPI
+
+    # Scale factor needed to bring the native size within EACH bound.
+    # A value >= 1 means that bound isn't a constraint (no upscaling).
+    width_scale = min(1.0, max_width / native_width_in) if native_width_in > 0 else 1.0
+    height_scale = min(1.0, MAX_IMAGE_HEIGHT_INCHES / native_height_in) if native_height_in > 0 else 1.0
+
+    # Use the smaller (more constraining) scale factor so the image fits
+    # within BOTH bounds simultaneously, preserving aspect ratio. Never
+    # exceeds 1.0, so a diagram already within bounds is never upscaled —
+    # it keeps its true native size.
+    scale = min(width_scale, height_scale, 1.0)
+
+    final_width = native_width_in * scale
+    final_height = native_height_in * scale
+
+    return Inches(final_width), Inches(final_height)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1232,7 +1317,10 @@ def insert_generated_quizzes_after_units(doc: Document, state):
 def insert_generated_diagrams(doc: Document, state):
     """
     Insert auto-generated diagrams into the document.
-    Images are capped to the page body width and centred.
+    Images are sized to fit within both the page body width AND a maximum
+    height (MAX_IMAGE_HEIGHT_INCHES), preserving native aspect ratio, then
+    centred. This prevents a naturally tall/narrow diagram from being
+    stretched into a multi-page-tall banner image.
     """
     diagrams = sorted(
         getattr(state, "generated_diagrams", []),
@@ -1257,16 +1345,20 @@ def insert_generated_diagrams(doc: Document, state):
             caption_para.runs[0].font.size = Pt(REQUIRED_BODY_SIZE_PT)
         image_para = insert_paragraph_after(caption_para)
         image_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        image_para.add_run().add_picture(
-            img_path,
-            width=_safe_image_width(doc, DIAGRAM_IMAGE_WIDTH_INCHES)
-        )
+        safe_width, safe_height = _safe_image_dimensions(doc, img_path, DIAGRAM_IMAGE_WIDTH_INCHES)
+        if safe_height is not None:
+            image_para.add_run().add_picture(img_path, width=safe_width, height=safe_height)
+        else:
+            image_para.add_run().add_picture(img_path, width=safe_width)
 
 
 def insert_advanced_visuals(doc: Document, state):
     """
     Insert advanced generated visuals into the document.
-    Images are capped to the page body width and centred.
+    Images are sized to fit within both the page body width AND a maximum
+    height (MAX_IMAGE_HEIGHT_INCHES), preserving native aspect ratio, then
+    centred. This prevents a naturally tall/narrow diagram from being
+    stretched into a multi-page-tall banner image.
     """
     visuals = sorted(
         [v for v in getattr(state, "generated_visuals", []) if v.status == "success" and v.image_path],
@@ -1288,10 +1380,11 @@ def insert_advanced_visuals(doc: Document, state):
             label_para.runs[0].font.size = Pt(REQUIRED_BODY_SIZE_PT)
         image_para = insert_paragraph_after(label_para)
         image_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        image_para.add_run().add_picture(
-            item.image_path,
-            width=_safe_image_width(doc, ADVANCED_VISUAL_WIDTH_INCHES)
-        )
+        safe_width, safe_height = _safe_image_dimensions(doc, item.image_path, ADVANCED_VISUAL_WIDTH_INCHES)
+        if safe_height is not None:
+            image_para.add_run().add_picture(item.image_path, width=safe_width, height=safe_height)
+        else:
+            image_para.add_run().add_picture(item.image_path, width=safe_width)
 
 
 def polish_doc_structure(doc: Document):
