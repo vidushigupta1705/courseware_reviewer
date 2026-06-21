@@ -4,6 +4,39 @@ from config import (
     DIAGRAM_MAX_RECOMMENDATIONS,
     DIAGRAM_PROCESS_KEYWORDS,
 )
+import re
+
+# Quiz question/answer lines must never be recommended for a diagram —
+# a diagram built from a quiz answer's prose (e.g. "Answer: Immersion
+# refers to the extent to which...") produces a meaningless visual, since
+# quiz content is evaluative text, not a process/concept description.
+# Same pattern set as docx_writer._is_quiz_paragraph, kept local here to
+# avoid a reverse dependency on the output-writing module from this
+# earlier-stage analysis module.
+_QUIZ_PARAGRAPH_PATTERNS = [
+    r'^quiz\b',
+    r'^multiple choice',
+    r'^fill in the blank',
+    r'^true or false',
+    r'^two[- ]mark',
+    r'^four[- ]mark',
+    r'^q[\.\)]',
+    r'^q\d+[\.\)]',
+    r'^\d+[\.\)]\s',
+    r'^[A-D][\.\)]\s',
+    r'^answer\s*:',
+    r'^reason\s*:',
+]
+
+
+def _is_quiz_paragraph(text: str) -> bool:
+    if not text:
+        return False
+    text = text.strip()
+    return any(
+        re.match(pattern, text, re.IGNORECASE)
+        for pattern in _QUIZ_PARAGRAPH_PATTERNS
+    )
 
 
 def _score_diagram_need(text: str) -> int:
@@ -52,6 +85,8 @@ def analyze_diagram_recommendations(state):
         if para.is_heading:
             continue
         if not para.text or len(para.text.strip()) < DIAGRAM_MIN_PARAGRAPH_CHARS:
+            continue
+        if _is_quiz_paragraph(para.text):
             continue
 
         score = _score_diagram_need(para.text)
